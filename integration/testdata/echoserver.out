@@ -1,0 +1,5 @@
+bind ok: 1
+listen ok: 1
+accepted: 1
+server got 13: ping over tcp
+client rc 0 echo 13: ping over tcp

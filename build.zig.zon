@@ -1,0 +1,20 @@
+.{
+    .name = .holyc,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    // Everything `zig build` needs: the two compiler modules (hcc/), the
+    // language server (lsp/), and the test/bench harness roots the build
+    // graph references. Docs, fixtures' goldens, and install scripts ride
+    // along with their directories; CI/packaging files stay out.
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "hcc",
+        "lsp",
+        "integration",
+        "bench",
+        "LICENSE",
+        "README.md",
+    },
+    .fingerprint = 0x67aeecdde9a8386c,
+}

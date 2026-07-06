@@ -1,0 +1,19 @@
+# Zig build artifacts
+.zig-cache/
+zig-out/
+
+# Built CLIs and release tarballs (`task build`)
+/bin/
+
+# Compiled outputs
+*.exe
+*.dll
+*.so
+*.dylib
+
+# env file
+.env
+
+# Editor/IDE
+.idea/
+.vscode/

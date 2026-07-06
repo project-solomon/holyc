@@ -1,0 +1,4 @@
+strlen("holyc") = 5
+sqrt(144) = 12
+pow(2,10) = 1024
+labs(-42) = 42

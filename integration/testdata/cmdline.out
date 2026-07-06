@@ -1,0 +1,3 @@
+argc=1
+argv non-null
+argv null-terminated
