@@ -1,0 +1,128 @@
+name: release
+
+# Manually triggered. Enter the version (e.g. 0.2.0); the release is tagged
+# v<version>. Builds hcc + holyc-lsp for linux/macos/windows (amd64 and arm64
+# where available), packages them as the assets install.sh/install.ps1 expect,
+# and publishes a GitHub release at the current commit.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, e.g. 0.2.0 (tag will be v<version>)"
+        required: true
+
+permissions:
+  contents: write # create the tag and release
+
+env:
+  ZIG_VERSION: "0.16.0"
+
+jobs:
+  build:
+    name: build ${{ matrix.arch }}-${{ matrix.osfrag }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-latest,    os: linux,   arch: amd64, osfrag: linux }
+          - { runner: ubuntu-24.04-arm, os: linux,   arch: arm64, osfrag: linux }
+          - { runner: macos-13,         os: darwin,  arch: amd64, osfrag: apple-darwin }
+          - { runner: macos-14,         os: darwin,  arch: arm64, osfrag: apple-darwin }
+          - { runner: windows-latest,   os: windows, arch: amd64, osfrag: windows }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      # hcc links libLLVM dynamically, so each runner needs LLVM 21 to build and
+      # link. The prefix is passed to `zig build -Dllvm-prefix`.
+      - name: Install LLVM 21 (Linux)
+        if: matrix.os == 'linux'
+        run: |
+          wget -qO llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 21
+          sudo apt-get install -y llvm-21-dev
+          echo "LLVM_PREFIX=/usr/lib/llvm-21" >> "$GITHUB_ENV"
+
+      - name: Install LLVM 21 (macOS)
+        if: matrix.os == 'darwin'
+        run: |
+          brew install llvm@21
+          echo "LLVM_PREFIX=$(brew --prefix llvm@21)" >> "$GITHUB_ENV"
+
+      - name: Install LLVM 21 (Windows)
+        if: matrix.os == 'windows'
+        run: |
+          choco install llvm --version=21.1.0 -y --no-progress
+          "LLVM_PREFIX=C:\Program Files\LLVM" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Build
+        if: matrix.os != 'windows'
+        run: zig build -Doptimize=ReleaseSafe -Dllvm-prefix="$LLVM_PREFIX"
+
+      - name: Build (Windows)
+        if: matrix.os == 'windows'
+        run: zig build -Doptimize=ReleaseSafe "-Dllvm-prefix=$env:LLVM_PREFIX"
+
+      # Asset layout the install scripts expect:
+      #   hcc-<tag>-<arch>-<osfrag>.tar.gz        → hcc binary + the std/ tree
+      #   holyc-lsp-<tag>-<arch>-<osfrag>.tar.gz  → holyc-lsp binary
+      # gzip-tar on every platform (install.ps1 uses the bundled tar.exe).
+      - name: Package
+        if: matrix.os != 'windows'
+        run: |
+          V="${{ inputs.version }}"; V="${V#v}"; TAG="v$V"
+          A="${{ matrix.arch }}-${{ matrix.osfrag }}"
+          mkdir -p dist stage
+          cp zig-out/bin/hcc stage/ && cp -R zig-out/std stage/std
+          tar -czf "dist/hcc-$TAG-$A.tar.gz" -C stage hcc std
+          rm -rf stage && mkdir stage
+          cp zig-out/bin/holyc-lsp stage/
+          tar -czf "dist/holyc-lsp-$TAG-$A.tar.gz" -C stage holyc-lsp
+
+      - name: Package (Windows)
+        if: matrix.os == 'windows'
+        run: |
+          $V = "${{ inputs.version }}" -replace '^v', ''; $TAG = "v$V"
+          $A = "${{ matrix.arch }}-windows"
+          New-Item -ItemType Directory -Force dist, stage | Out-Null
+          Copy-Item zig-out\bin\hcc.exe stage\
+          Copy-Item -Recurse zig-out\std stage\std
+          tar -czf "dist\hcc-$TAG-$A.tar.gz" -C stage hcc.exe std
+          Remove-Item -Recurse -Force stage; New-Item -ItemType Directory -Force stage | Out-Null
+          Copy-Item zig-out\bin\holyc-lsp.exe stage\
+          tar -czf "dist\holyc-lsp-$TAG-$A.tar.gz" -C stage holyc-lsp.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.arch }}-${{ matrix.osfrag }}
+          path: dist/*.tar.gz
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: cd dist && sha256sum *.tar.gz > SHA256SUMS
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          V="${{ inputs.version }}"; V="${V#v}"; TAG="v$V"
+          gh release create "$TAG" dist/*.tar.gz dist/SHA256SUMS \
+            --repo "${{ github.repository }}" \
+            --target "${{ github.sha }}" \
+            --title "holyc $TAG" \
+            --generate-notes

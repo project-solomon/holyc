@@ -47,6 +47,14 @@ pub fn build(b: *std.Build) void {
     llvm_mod.linkSystemLibrary("LLVM", .{});
     llvm_mod.link_libc = true;
 
+    // The hcc.toml manifest parser/editor: a small dependency-free module,
+    // shared by the compiler driver and the language server.
+    const mod_mod = b.addModule("mod", .{
+        .root_source_file = b.path("hcc/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const exe = b.addExecutable(.{
         .name = "hcc",
         .root_module = b.createModule(.{
@@ -56,6 +64,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "hcc", .module = frontend_mod },
                 .{ .name = "llvm", .module = llvm_mod },
+                .{ .name = "mod", .module = mod_mod },
             },
         }),
     });
@@ -87,6 +96,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "hcc", .module = frontend_mod },
+            .{ .name = "mod", .module = mod_mod },
         },
     });
     const lsp_exe = b.addExecutable(.{
@@ -114,11 +124,7 @@ pub fn build(b: *std.Build) void {
 
     // hcc.toml manifest parser/editor: a standalone, dependency-free module
     // (pure string handling), so it is tested on its own.
-    const mod_tests = b.addTest(.{ .root_module = b.createModule(.{
-        .root_source_file = b.path("hcc/mod.zig"),
-        .target = target,
-        .optimize = optimize,
-    }) });
+    const mod_tests = b.addTest(.{ .root_module = mod_mod });
     const run_mod_tests = b.addRunArtifact(mod_tests);
 
     // The e2e harness: a standalone black-box driver with NO code

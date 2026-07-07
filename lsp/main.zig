@@ -34,6 +34,8 @@ pub fn main(init: std.process.Init) !void {
     var include_arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
     defer include_arena.deinit();
     server.include_path = Server.computeIncludePath(include_arena.allocator(), io, init.environ_map) catch &.{};
+    // The package root, so the editor resolves hcc.toml alias includes like hcc.
+    server.pkg_dir = Server.pkgDir(include_arena.allocator(), io, init.environ_map);
 
     // Where the embedded prelude is extracted so go-to-definition can jump into
     // it (`<HCC_ROOT>/.cache/core`). gpa-owned; freed in server.deinit.

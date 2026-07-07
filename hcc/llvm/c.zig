@@ -23,6 +23,13 @@ pub const ErrorRef = opaque {};
 
 pub const Bool = c_int;
 
+// ---- version ----
+
+/// Fills in the running libLLVM's version (it links dynamically, so the version
+/// is a runtime property). Used to key the build cache: a libLLVM upgrade can
+/// change codegen even when hcc itself is unchanged.
+pub extern fn LLVMGetVersion(major: *c_uint, minor: *c_uint, patch: *c_uint) void;
+
 // ---- context / module / builder ----
 
 pub extern fn LLVMContextCreate() *Context;

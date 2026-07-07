@@ -15,6 +15,9 @@ pub const Error = backend.Error;
 pub const EmitKind = backend.EmitKind;
 pub const Options = backend.Options;
 pub const emit = backend.emit;
+pub const emitObject = backend.emitObject;
+pub const linkObject = backend.linkObject;
+pub const llvmVersion = backend.llvmVersion;
 
 test {
     @import("std").testing.refAllDecls(@This());

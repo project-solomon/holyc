@@ -6,7 +6,7 @@
 const std = @import("std");
 const hcc = @import("hcc");
 const llvm = @import("llvm");
-const mod = @import("mod.zig");
+const mod = @import("mod");
 
 const usage_line = "usage: hcc [options] <input.HC>...   (try `hcc --help`)\n";
 
@@ -881,11 +881,16 @@ fn run(arena: std.mem.Allocator, io: std.Io, cli: Cli, stderr: *std.Io.Writer) !
     }
 }
 
-/// Emits the artifact, consulting the content-addressed build cache first. A
-/// hit copies the stored artifact to out_path and skips codegen + linking
-/// entirely (the expensive LLVM O2 + link step); a miss builds normally and
-/// then stores the result. The cache is content-addressed, so a hit is always
-/// correct; any cache I/O failure silently falls back to a normal build.
+/// The cache-format version. Bumping it changes the `v<N>` subdir, retiring
+/// every prior entry without a manual clear.
+const cache_format: u32 = 1;
+
+/// Emits the artifact through the content-addressed build cache. The cached unit
+/// is the OBJECT — the expensive LLVM O2 + codegen output — never the linked
+/// artifact: linking is cheap and re-run every build, so a changed library is
+/// always picked up. Flow: obtain the object (from cache, or by building and
+/// storing it), then for --emit obj copy it out, else link it against the
+/// current -l/-L/--cc. Any cache I/O failure degrades to a normal build.
 fn emitCached(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -900,18 +905,46 @@ fn emitCached(
     const cache_file: ?[]const u8 = if (cli.no_cache) null else blk: {
         const dir = cli.cache_dir orelse break :blk null;
         const key = cacheKey(arena, io, cli, digest, kind) catch break :blk null;
-        break :blk std.fs.path.join(arena, &.{ dir, key }) catch break :blk null;
+        // Shard by the first hash byte so no single directory grows unbounded;
+        // the v<N> level lets a format bump retire everything at once.
+        break :blk std.fs.path.join(arena, &.{
+            dir, comptimeVerDir(), key[0..2], key,
+        }) catch break :blk null;
     };
 
-    // Cache hit: reuse the stored artifact (permissions, incl. the exec bit,
-    // are preserved by copyFile).
-    if (cache_file) |cf| {
-        if (cwd.access(io, cf, .{})) |_| {
-            if (cwd.copyFile(cf, cwd, out_path, io, .{ .make_path = true })) |_| return else |_| {}
-        } else |_| {}
-    }
+    // The object we will link/copy: a cache hit uses the stored object in place;
+    // otherwise build it and (best-effort) store it for next time.
+    const obj: []const u8 = obtain: {
+        if (cache_file) |cf| {
+            if (cwd.access(io, cf, .{})) |_| {
+                break :obtain cf; // hit
+            } else |_| {}
+        }
+        // Miss: build the object to a temp beside the output, then cache it.
+        const tmp_obj = try std.fmt.allocPrint(arena, "{s}.build.o", .{out_path});
+        try llvm.emitObject(arena, diags, prog, .{
+            .target = cli.target,
+            .kind = kind,
+            .out_path = out_path, // unused by emitObject; the object path is explicit
+        }, tmp_obj);
+        if (cache_file) |cf| {
+            if (cwd.copyFile(tmp_obj, cwd, cf, io, .{ .make_path = true })) |_| {
+                cwd.deleteFile(io, tmp_obj) catch {};
+                break :obtain cf;
+            } else |_| {}
+        }
+        break :obtain tmp_obj; // uncached (or store failed): link/copy the temp
+    };
+    // Clean up a temp object once we are done with it (not the cache file).
+    defer if (cache_file == null or !std.mem.eql(u8, obj, cache_file.?))
+        cwd.deleteFile(io, obj) catch {};
 
-    try llvm.emit(arena, diags, io, prog, .{
+    if (kind == .obj) {
+        cwd.copyFile(obj, cwd, out_path, io, .{ .make_path = true }) catch |e|
+            return diags.fail(.codegen, 0, .{}, "cannot write {s}: {s}", .{ out_path, @errorName(e) });
+        return;
+    }
+    try llvm.linkObject(arena, diags, io, obj, .{
         .target = cli.target,
         .kind = kind,
         .out_path = out_path,
@@ -919,15 +952,19 @@ fn emitCached(
         .lib_dirs = cli.lib_dirs,
         .cc = cli.cc,
     });
-
-    // Populate the cache (best-effort: a failure here never fails the build).
-    if (cache_file) |cf| cwd.copyFile(out_path, cwd, cf, io, .{ .make_path = true }) catch {};
 }
 
-/// The build-cache filename for a compile: a hex SHA-256 over the compiler's own
-/// binary (so a toolchain change invalidates), the resolved-source digest, the
-/// target, the emit kind, and the link inputs (-l/-L/--cc). Errors if the
-/// compiler binary can't be read — the caller then skips the cache.
+fn comptimeVerDir() []const u8 {
+    return std.fmt.comptimePrint("v{d}", .{cache_format});
+}
+
+/// The object-cache key (hex SHA-256). Covers everything that affects the
+/// object bytes: the cache format, the compiler's own binary (any codegen
+/// change), the libLLVM version (it links dynamically), the resolved-source
+/// digest, the target, and the lowering mode (whole-program for exe vs a
+/// separate-compilation unit for obj/shared). Link inputs are deliberately
+/// excluded — linking is a separate, always-run step. Errors if the compiler
+/// binary can't be read, so the caller skips the cache.
 fn cacheKey(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -936,19 +973,20 @@ fn cacheKey(
     kind: llvm.EmitKind,
 ) ![]const u8 {
     var h = std.crypto.hash.sha2.Sha256.init(.{});
+    h.update(std.mem.asBytes(&cache_format));
     // Compiler identity: the running binary's own bytes (catches every codegen
     // change, not just a version bump).
     const exe_path = try std.process.executablePathAlloc(io, arena);
     const exe_bytes = try std.Io.Dir.cwd().readFileAlloc(io, exe_path, arena, .limited(256 << 20));
     hashChunk(&h, exe_bytes);
+    // Backend identity: libLLVM is linked dynamically, so its version can change
+    // codegen without changing hcc.
+    h.update(std.mem.asBytes(&llvm.llvmVersion()));
     hashChunk(&h, &digest);
     hashChunk(&h, std.mem.asBytes(&cli.target));
-    h.update(&[_]u8{@intFromEnum(kind)});
-    for (cli.libs) |l| hashChunk(&h, l);
-    h.update(&[_]u8{0}); // list terminator: keeps {"ab"} distinct from {"a","b"}
-    for (cli.lib_dirs) |l| hashChunk(&h, l);
-    h.update(&[_]u8{0});
-    if (cli.cc) |c| hashChunk(&h, c);
+    // The object depends on the lowering mode, not the emit kind: obj and shared
+    // both lower as libraries and share one object; exe is whole-program.
+    h.update(&[_]u8{@intFromBool(kind == .exe)});
     var out: [32]u8 = undefined;
     h.final(&out);
     const hex = std.fmt.bytesToHex(out, .lower);

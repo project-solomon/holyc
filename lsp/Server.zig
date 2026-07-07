@@ -20,6 +20,7 @@ const framing = @import("framing.zig");
 const uri_util = @import("uri.zig");
 const position = @import("position.zig");
 const nav = @import("nav.zig");
+const mod = @import("mod");
 
 gpa: std.mem.Allocator,
 io: std.Io,
@@ -29,6 +30,9 @@ out: *std.Io.Writer,
 /// so analysis resolves standard-library and package includes like hcc.
 /// Set by main after init; empty means std/pkg includes will not resolve.
 include_path: []const []const u8 = &.{},
+/// The third-party package root ($HCC_PATH/pkg), where remote hcc.toml
+/// dependencies are cloned. Set by main; used to resolve alias includes.
+pkg_dir: ?[]const u8 = null,
 /// uri → open document. Keys and texts are gpa-owned.
 docs: std.StringArrayHashMapUnmanaged(Document) = .empty,
 /// Directory the embedded prelude is extracted into (`<HCC_ROOT>/.cache/core`)
@@ -456,6 +460,14 @@ pub fn computeIncludePath(arena: std.mem.Allocator, io: std.Io, env: anytype) er
     return path.items;
 }
 
+/// The third-party package root ($HCC_PATH/pkg, HCC_PATH defaulting to the
+/// toolchain root), where remote hcc.toml dependencies are cloned. Null when the
+/// root cannot be resolved.
+pub fn pkgDir(arena: std.mem.Allocator, io: std.Io, env: anytype) ?[]const u8 {
+    const hcc_path = env.get("HCC_PATH") orelse resolveRoot(arena, io, env) orelse return null;
+    return std.fs.path.join(arena, &.{ hcc_path, "pkg" }) catch null;
+}
+
 /// The toolchain root: $HCC_ROOT, else the parent of the running binary's
 /// directory (bin/holyc-lsp yields the tree beside bin/), else null.
 fn resolveRoot(arena: std.mem.Allocator, io: std.Io, env: anytype) ?[]const u8 {
@@ -475,6 +487,69 @@ pub fn coreCacheDir(gpa: std.mem.Allocator, io: std.Io, env: anytype) ?[]u8 {
     const root = resolveRoot(a, io, env) orelse return null;
     const dir = std.fs.path.join(a, &.{ root, ".cache", "core" }) catch return null;
     return gpa.dupe(u8, dir) catch null;
+}
+
+const FoundManifest = struct { path: []const u8, bytes: []const u8 };
+
+/// Finds the nearest hcc.toml walking up from `start_dir`.
+fn findManifest(io: std.Io, arena: std.mem.Allocator, start_dir: []const u8) !?FoundManifest {
+    var dir: []const u8 = std.Io.Dir.cwd().realPathFileAlloc(io, start_dir, arena) catch return null;
+    while (true) {
+        const cand = try std.fs.path.join(arena, &.{ dir, mod.file_name });
+        if (std.Io.Dir.cwd().readFileAlloc(io, cand, arena, .limited(1 << 20))) |bytes| {
+            return .{ .path = cand, .bytes = bytes };
+        } else |e| if (e == error.OutOfMemory) return error.OutOfMemory;
+        const parent = std.fs.path.dirname(dir) orelse break;
+        if (std.mem.eql(u8, parent, dir)) break;
+        dir = parent;
+    }
+    return null;
+}
+
+/// The include alias map for a document: the nearest hcc.toml's dependencies,
+/// each mapped to its absolute directory under the alias its own `name`'s last
+/// segment gives (or an `as` override). Matches how the compiler resolves module
+/// aliases, so `#include <json/File.HC>` analyzes without a false error. Empty
+/// when there is no manifest.
+fn aliasesFor(s: *Server, arena: std.mem.Allocator, base_dir: []const u8) !std.StringHashMapUnmanaged([]const u8) {
+    var map: std.StringHashMapUnmanaged([]const u8) = .empty;
+    const found = (try findManifest(s.io, arena, base_dir)) orelse return map;
+    var visited: std.StringHashMapUnmanaged(void) = .empty;
+    try s.mergeNames(arena, &map, &visited, found.path, found.bytes);
+    return map;
+}
+
+fn mergeNames(
+    s: *Server,
+    arena: std.mem.Allocator,
+    map: *std.StringHashMapUnmanaged([]const u8),
+    visited: *std.StringHashMapUnmanaged(void),
+    manifest_path: []const u8,
+    bytes: []const u8,
+) Error!void {
+    const dir = std.fs.path.dirname(manifest_path) orelse ".";
+    const manifest = try mod.parse(arena, bytes);
+    for (manifest.deps) |d| {
+        var depdir: []const u8 = undefined;
+        if (d.git) |g| {
+            const pkg = s.pkg_dir orelse continue;
+            depdir = try std.fs.path.join(arena, &.{ pkg, g });
+        } else if (d.path) |p| {
+            const joined = if (std.fs.path.isAbsolute(p)) p else try std.fs.path.join(arena, &.{ dir, p });
+            depdir = std.Io.Dir.cwd().realPathFileAlloc(s.io, joined, arena) catch joined;
+        } else continue;
+
+        const sub = try std.fs.path.join(arena, &.{ depdir, mod.file_name });
+        const sub_bytes: ?[]const u8 = if (std.Io.Dir.cwd().readFileAlloc(s.io, sub, arena, .limited(1 << 20))) |b|
+            b
+        else |e| if (e == error.OutOfMemory) return error.OutOfMemory else null;
+        const own_name: ?[]const u8 = if (sub_bytes) |sb| (try mod.parse(arena, sb)).name else null;
+        const alias = d.as_ orelse mod.defaultAlias(own_name orelse d.source());
+        const gop = try map.getOrPut(arena, alias);
+        if (!gop.found_existing) gop.value_ptr.* = depdir;
+        if ((try visited.getOrPut(arena, depdir)).found_existing) continue;
+        if (sub_bytes) |sb| try s.mergeNames(arena, map, visited, sub, sb);
+    }
 }
 
 // ---- analysis and diagnostics ----
@@ -514,6 +589,7 @@ fn analyzeAndPublish(s: *Server, uri: []const u8, doc: *Document) Error!void {
         .target = hcc.target.Target.host(),
         .inject_prelude = true,
         .include_path = s.include_path,
+        .aliases = try s.aliasesFor(arena, base_dir),
         .files_out = &files,
     }) catch |e| switch (e) {
         error.CompileFailed => null,
@@ -642,6 +718,7 @@ fn wsIndexPath(s: *Server, abs_path: []const u8) Error!void {
         .target = hcc.target.Target.host(),
         .inject_prelude = true,
         .include_path = s.include_path,
+        .aliases = s.aliasesFor(tmp, base_dir) catch .empty,
     }) catch return;
 
     const uri = try nav.pathToUri(s.gpa, abs_path);

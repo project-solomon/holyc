@@ -45,14 +45,47 @@ fn ensureTargets() void {
     }
 }
 
-/// Compiles a checked program to opts.out_path. Errors are reported through
-/// diags with stage .codegen.
+/// The running libLLVM version (major, minor, patch). It links dynamically, so
+/// this is a runtime property; the driver folds it into the build-cache key so a
+/// libLLVM upgrade invalidates cached objects even when hcc is unchanged.
+pub fn llvmVersion() [3]c_uint {
+    var major: c_uint = 0;
+    var minor: c_uint = 0;
+    var patch: c_uint = 0;
+    c.LLVMGetVersion(&major, &minor, &patch);
+    return .{ major, minor, patch };
+}
+
+/// Compiles a checked program to opts.out_path: produces the object, then links
+/// it. A convenience over emitObject + linkObject for callers that do not cache
+/// (e.g. the #exe executor); the driver caches the object and links separately.
 pub fn emit(
     arena: std.mem.Allocator,
     diags: *diag.Diagnostics,
     io: std.Io,
     prog: *const ast.Program,
     opts: Options,
+) Error!void {
+    if (opts.kind == .obj) return emitObject(arena, diags, prog, opts, opts.out_path);
+    // The suffix must end in ".o": compiler drivers (zig cc in particular)
+    // classify link inputs by extension.
+    const obj_path = try std.fmt.allocPrint(arena, "{s}.tmp.o", .{opts.out_path});
+    defer std.Io.Dir.cwd().deleteFile(io, obj_path) catch {};
+    try emitObject(arena, diags, prog, opts, obj_path);
+    try linkObject(arena, diags, io, obj_path, opts);
+}
+
+/// Lowers, verifies, and optimizes the program, writing the native object to
+/// obj_path. This is the expensive, cacheable step (LLVM O2 + codegen); linking
+/// is separate (linkObject) so it can run against current libraries every time.
+/// opts.kind selects the lowering mode (exe = whole program; obj/shared =
+/// separate-compilation unit that exports its public definitions).
+pub fn emitObject(
+    arena: std.mem.Allocator,
+    diags: *diag.Diagnostics,
+    prog: *const ast.Program,
+    opts: Options,
+    obj_path: []const u8,
 ) Error!void {
     ensureTargets();
 
@@ -128,16 +161,7 @@ pub fn emit(
         }
     }
 
-    // Emit the object: directly to out_path for --emit obj, else to a
-    // temporary next to the final artifact, cleaned up after linking.
-    const obj_path = if (opts.kind == .obj)
-        opts.out_path
-    else
-        // The suffix must end in ".o": compiler drivers (zig cc in
-        // particular) classify link inputs by extension.
-        try std.fmt.allocPrint(arena, "{s}.tmp.o", .{opts.out_path});
     const obj_path_z = try arena.dupeZ(u8, obj_path);
-
     var emit_msg: ?[*:0]u8 = null;
     if (c.LLVMTargetMachineEmitToFile(tm, module, obj_path_z, .object, &emit_msg) != 0) {
         defer if (emit_msg) |m| c.LLVMDisposeMessage(m);
@@ -145,18 +169,16 @@ pub fn emit(
             obj_path, if (emit_msg) |m| std.mem.span(m) else "unknown error",
         });
     }
-    if (opts.kind == .obj) return;
-    defer std.Io.Dir.cwd().deleteFile(io, obj_path) catch {};
-
-    try link(arena, diags, io, obj_path, opts);
 }
 
-/// Links through a C compiler driver, which brings in crt, libc, and the
-/// platform linker. The driver is opts.cc when given; otherwise the system
-/// `cc` for the host target, or `zig cc -target <triple>` for a cross target
-/// (Zig ships headers and libc stubs for every triple hcc supports, so no
-/// sysroot setup is needed).
-fn link(arena: std.mem.Allocator, diags: *diag.Diagnostics, io: std.Io, obj_path: []const u8, opts: Options) Error!void {
+/// Links obj_path into opts.out_path through a C compiler driver, which brings
+/// in crt, libc, and the platform linker. The driver is opts.cc when given;
+/// otherwise the system `cc` for the host target, or `zig cc -target <triple>`
+/// for a cross target (Zig ships headers and libc stubs for every triple hcc
+/// supports, so no sysroot setup is needed). Run separately from emitObject so
+/// it always links against current libraries (opts.libs/lib_dirs), even on a
+/// cached object.
+pub fn linkObject(arena: std.mem.Allocator, diags: *diag.Diagnostics, io: std.Io, obj_path: []const u8, opts: Options) Error!void {
     const host = std.meta.eql(opts.target, target_mod.Target.host());
     var argv: std.ArrayList([]const u8) = .empty;
     if (opts.cc) |driver| {
