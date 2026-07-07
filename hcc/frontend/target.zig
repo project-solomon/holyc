@@ -1,13 +1,12 @@
-//! The compilation target: the structured (LLVM-free) view the front end
-//! needs — arch for the `__amd64__`/`__arm64__` macros and `asm` block
-//! selection, OS for the platform macros and the backend's OS-specific
-//! lowering, an optional libc ABI for Linux/Windows triples. The backend's
+//! The compilation target: the structured (LLVM-free) view the front end needs.
+//! arch drives the `__amd64__`/`__arm64__` macros and `asm` block selection, OS
+//! drives the platform macros and the backend's OS-specific lowering, and an
+//! optional libc ABI applies to Linux/Windows triples. The backend's
 //! `llvmTriple` is the single seam where these map to LLVM's spellings.
 //!
-//! Deliberately minimal: only the architectures and OSes the toolchain
-//! actually compiles for. The triple syntax still reads/writes the
-//! conventional vendor component, but it is derived from the OS rather than
-//! stored.
+//! Covers only the architectures and OSes the toolchain compiles for. The
+//! triple syntax still reads/writes the conventional vendor component, but it is
+//! derived from the OS rather than stored.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -167,7 +166,7 @@ pub const Target = struct {
         if (it.next() != null) return error.MissingComponents;
 
         // An unset ABI is always fine (the norm for darwin). A set ABI must
-        // be one the OS actually knows.
+        // be one the OS knows.
         const abi_ok = switch (t.abi) {
             .unset => true,
             .gnu => t.os != .darwin,
@@ -227,9 +226,44 @@ pub const Target = struct {
     }
 };
 
+/// Writes the human-readable list of supported targets, for `hcc --target
+/// --help`. Curated (aliases and per-OS notes need prose); keep in sync with
+/// the Arch/Os/Abi enums above.
+pub fn writeSupported(w: *std.Io.Writer) std.Io.Writer.Error!void {
+    try w.print(
+        \\A target is <arch>-<vendor>-<os>[-<abi>]. The default is the host ({f}).
+        \\
+        \\Architectures  amd64 (x86_64), arm64 (aarch64), riscv64, ppc64le, s390x
+        \\Systems        darwin, linux, windows
+        \\ABIs           gnu, musl, msvc   (optional; omit for the OS default)
+        \\
+        \\Examples:
+        \\  arm64-apple-darwin         Apple Silicon macOS
+        \\  amd64-apple-darwin         Intel macOS
+        \\  amd64-unknown-linux-gnu    x86-64 Linux (glibc)
+        \\  arm64-unknown-linux-musl   ARM64 Linux (musl)
+        \\  riscv64-unknown-linux      RISC-V Linux
+        \\  ppc64le-unknown-linux      POWER (little-endian) Linux
+        \\  s390x-unknown-linux        IBM Z Linux
+        \\  amd64-pc-windows           x86-64 Windows
+        \\
+        \\riscv64, ppc64le, and s390x are linux-only; apple and darwin imply
+        \\each other. The vendor is otherwise free (unknown/pc/…).
+        \\
+    , .{Target.host()});
+}
+
 // ---- tests ----
 
 const testing = std.testing;
+
+test "writeSupported renders" {
+    var buf: [1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try writeSupported(&w);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "riscv64") != null);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "Examples:") != null);
+}
 
 test "parse canonical and alias triples" {
     const t1 = try Target.parse("amd64-unknown-linux");

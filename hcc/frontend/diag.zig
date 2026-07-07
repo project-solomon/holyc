@@ -9,7 +9,7 @@ const source = @import("source.zig");
 
 pub const Severity = enum { @"error", warning };
 
-/// Which pass raised a diagnostic; preserved so callers can tell layers apart.
+/// Which pass raised a diagnostic.
 pub const Stage = enum { lex, preproc, parse, sema, layout, codegen };
 
 pub const Diagnostic = struct {

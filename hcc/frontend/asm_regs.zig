@@ -38,7 +38,7 @@ pub fn archName(arch: target.Arch) []const u8 {
 /// Whether name (case-insensitive) is a register of arch, so an identifier
 /// operand is a register rather than a variable/symbol reference. HolyC asm
 /// is case-insensitive for register names: RAX and rax are the same register.
-/// This is the full operand vocabulary — a superset of the pinnable GP set —
+/// This is the full operand vocabulary (a superset of the pinnable GP set),
 /// including the stack/frame/instruction/zero registers and the FP/vector
 /// files.
 pub fn isRegister(arch: []const u8, name: []const u8) bool {
@@ -55,7 +55,7 @@ pub fn isRegister(arch: []const u8, name: []const u8) bool {
 
 /// The canonical 64-bit general-purpose register for a register spelling
 /// (case-insensitive), or null when it has no pinnable/clobberable GP form.
-/// The stack/frame/instruction/zero registers are deliberately absent: they
+/// The stack/frame/instruction/zero registers are absent: they
 /// may be named in an operand but are never pinned or clobbered.
 pub fn canonGp(arch: target.Arch, name: []const u8) ?[]const u8 {
     var buf: [8]u8 = undefined;
@@ -238,7 +238,7 @@ const riscv64_canon_gp = std.StaticStringMap([]const u8).initComptime(blk: {
     @setEvalBranchQuota(40_000);
     // Canonical names are the x registers (LLVM's constraint spelling).
     // zero (x0), ra (x1), sp (x2), gp (x3), tp (x4), and s0/fp (x8) are
-    // deliberately absent: never pinned or clobbered.
+    // absent: never pinned or clobbered.
     var entries: []const CanonEntry = &.{};
     for (5..32) |i| {
         if (i == 8) continue;
@@ -266,7 +266,7 @@ const riscv64_canon_gp = std.StaticStringMap([]const u8).initComptime(blk: {
 const ppc64le_canon_gp = std.StaticStringMap([]const u8).initComptime(blk: {
     @setEvalBranchQuota(40_000);
     // r1 (stack pointer), r2 (TOC), r13 (thread pointer), and r31 (frame
-    // pointer when present) are deliberately absent: never pinned or
+    // pointer when present) are absent: never pinned or
     // clobbered. r0 stays clobberable (it is a mutable GPR) even though
     // pinning it is inadvisable (r0 reads as zero in address bases).
     var entries: []const CanonEntry = &.{};
@@ -281,7 +281,7 @@ const ppc64le_canon_gp = std.StaticStringMap([]const u8).initComptime(blk: {
 const s390x_canon_gp = std.StaticStringMap([]const u8).initComptime(blk: {
     @setEvalBranchQuota(40_000);
     // r15 (stack pointer) and r11 (frame pointer when present) are
-    // deliberately absent. r14 (return address) stays, mirroring arm64's lr.
+    // absent. r14 (return address) stays, mirroring arm64's lr.
     var entries: []const CanonEntry = &.{};
     for (0..16) |i| {
         if (i == 11 or i == 15) continue;

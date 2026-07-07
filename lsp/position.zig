@@ -2,8 +2,8 @@
 //!
 //! LSP positions are 0-based line/character pairs where `character` counts
 //! UTF-16 code units. HolyC sources are ASCII in practice, so this module
-//! deliberately counts bytes instead — a simplification that is exact for
-//! ASCII and approximate for any stray multi-byte UTF-8.
+//! counts bytes instead: exact for ASCII, approximate for any stray
+//! multi-byte UTF-8.
 
 const std = @import("std");
 

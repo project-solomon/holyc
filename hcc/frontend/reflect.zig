@@ -11,10 +11,9 @@
 //!   - `Class(name)` returning the matching descriptor (or NULL).
 //!
 //! It runs after parsing and before sema, so the synthesized AST is
-//! type-checked, laid out, and lowered like any other code; no new backend
-//! machinery is needed. Descriptor globals are ordinary BSS filled by
-//! entry-time stores, and names are ordinary string literals. It is emitted
-//! only when the program uses Class/ClassRep.
+//! type-checked, laid out, and lowered like any other code, needing no new
+//! backend machinery. Descriptor globals are BSS filled by entry-time stores;
+//! names are string literals. Emitted only when the program uses Class/ClassRep.
 
 const std = @import("std");
 const source = @import("source.zig");

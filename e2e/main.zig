@@ -1,34 +1,34 @@
-//! The integration harness: a standalone black-box test driver with no code
-//! dependency on the compiler. It invokes the installed `hcc` from the PATH
-//! (run install.sh to build and install it from source), compiles every
-//! fixture in the testdata directory with it, runs each produced executable,
-//! and byte-compares its stdout against the reviewed golden `<fixture>.out`.
+//! The e2e harness: a standalone test driver with no code dependency on the
+//! compiler. It invokes the installed `hcc` from the PATH (run install.sh to
+//! build and install it), compiles every fixture in the golden directory,
+//! runs each produced executable, and byte-compares its stdout against the
+//! golden `<fixture>.out`.
 //!
-//! Usage: integration <testdata-dir>
+//! Usage: e2e <golden-dir>
 //!
-//! Fixtures run in sorted order with a live progress line each (compile and
-//! run timings); failures print their detail immediately, and the run ends
-//! with a timed summary.
+//! Fixtures run in sorted order with a progress line each (compile and run
+//! timings). Failures print their detail immediately; the run ends with a
+//! timed summary.
 //!
 //! Fixtures are the contract and are never edited or skipped to make a run
-//! pass; if a fixture legitimately needs different behavior, the harness
-//! compiles/runs that file with different hcc CLI arguments instead.
+//! pass. A fixture needing different behavior is compiled/run with different
+//! hcc CLI arguments instead.
 //!
-//! Host target only; exit codes of the fixture binaries are not compared —
+//! Host target only. Exit codes of the fixture binaries are not compared;
 //! goldens are stdout only, matching the retired Go conform_test.go. Exits 0
 //! iff every fixture matches its golden.
 
 const std = @import("std");
 
-const usage = "usage: integration <testdata-dir>\n";
+const usage = "usage: e2e <golden-dir>\n";
 
-/// The compiler under test, resolved from the PATH at spawn time (install it
-/// with install.sh).
+/// Compiler under test, resolved from PATH at spawn time (install with
+/// install.sh).
 const hcc = "hcc";
 
 /// Scratch dir for the compiled fixture executables: deterministic, inside
 /// the (gitignored) zig-out, wiped before and after a run.
-const tmp_dir_path = "zig-out/integration-tmp";
+const tmp_dir_path = "zig-out/e2e-tmp";
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -41,22 +41,22 @@ pub fn main(init: std.process.Init) !void {
 
     var args = std.process.Args.Iterator.init(init.minimal.args);
     _ = args.next(); // argv[0]
-    const testdata_dir = args.next() orelse {
+    const golden_dir = args.next() orelse {
         try out.writeAll(usage);
         try out.flush();
         std.process.exit(2);
     };
 
     const cwd = std.Io.Dir.cwd();
-    var dir = cwd.openDir(io, testdata_dir, .{ .iterate = true }) catch |e| {
-        try out.print("integration: cannot open testdata dir {s}: {s}\n", .{ testdata_dir, @errorName(e) });
+    var dir = cwd.openDir(io, golden_dir, .{ .iterate = true }) catch |e| {
+        try out.print("e2e: cannot open golden dir {s}: {s}\n", .{ golden_dir, @errorName(e) });
         try out.flush();
         std.process.exit(2);
     };
     defer dir.close(io);
 
     // Collect and sort the fixture names first: deterministic run order, a
-    // real total for the header, and a column width for aligned output.
+    // total for the header, and a column width for aligned output.
     var names: std.ArrayList([]const u8) = .empty;
     var max_name_len: usize = 0;
     {
@@ -76,12 +76,12 @@ pub fn main(init: std.process.Init) !void {
     }.lessThan);
 
     if (names.items.len == 0) {
-        try out.print("integration: no .HC fixtures found in {s}\n", .{testdata_dir});
+        try out.print("e2e: no .HC fixtures found in {s}\n", .{golden_dir});
         try out.flush();
         std.process.exit(2);
     }
 
-    try out.print("integration: {s} (from PATH) over {s} — {d} fixtures\n", .{ hcc, testdata_dir, names.items.len });
+    try out.print("e2e: {s} (from PATH) over {s} — {d} fixtures\n", .{ hcc, golden_dir, names.items.len });
     try out.flush();
 
     cwd.deleteTree(io, tmp_dir_path) catch {};
@@ -97,7 +97,7 @@ pub fn main(init: std.process.Init) !void {
         const a = arena_state.allocator();
 
         const stem = name[0 .. name.len - ".HC".len];
-        const src_path = try std.fs.path.join(a, &.{ testdata_dir, name });
+        const src_path = try std.fs.path.join(a, &.{ golden_dir, name });
         const golden_name = try std.fmt.allocPrint(a, "{s}.out", .{stem});
         const golden = try dir.readFileAlloc(io, golden_name, a, .limited(16 << 20));
 
@@ -159,7 +159,7 @@ pub fn main(init: std.process.Init) !void {
 
     const total = t_start.durationTo(std.Io.Clock.Timestamp.now(io, .awake));
     const total_s = @as(f64, @floatFromInt(total.raw.toNanoseconds())) / 1e9;
-    try out.print("integration: {d} passed, {d} failed in {d:.1}s\n", .{ passed, failed, total_s });
+    try out.print("e2e: {d} passed, {d} failed in {d:.1}s\n", .{ passed, failed, total_s });
     try out.flush();
     if (failed > 0) std.process.exit(1);
 }

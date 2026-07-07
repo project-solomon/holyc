@@ -1,21 +1,21 @@
 //! The benchmark harness: a standalone driver with no code dependency on the
-//! compiler, mirroring the integration harness. It invokes the installed
-//! `hcc` from the PATH (run install.sh to build and install it from source),
-//! just as it invokes `clang`. Each case in the testdata directory is a
-//! `<stem>.HC` / `<stem>.c` pair implementing the same workload; the harness
-//! compiles the HolyC side with hcc and the C side with clang at every
-//! optimization level, then reports two tables of mean wall-clock times — one
-//! for execution, one for compilation. Outputs are not compared; this is
-//! purely a timing comparison.
+//! compiler. It invokes the installed `hcc` from the PATH (run install.sh to
+//! build and install it) and `clang`. Each case in the benchmarks directory
+//! is a `<stem>.HC` / `<stem>.c` pair implementing the same workload; the
+//! harness compiles the HolyC side with hcc and the C side with clang at every
+//! optimization level, then reports the target (the host; neither compiler
+//! cross-compiles) and two tables of mean wall-clock times, one for execution
+//! and one for compilation. Ratios are hcc/clang (above 1.00x, hcc is slower).
+//! Outputs are not compared; this is a timing comparison only.
 //!
-//! Usage: bench <testdata-dir>
+//! Usage: bench <benchmarks-dir>
 
 const std = @import("std");
 
-const usage = "usage: bench <testdata-dir>\n";
+const usage = "usage: bench <benchmarks-dir>\n";
 
-/// The compiler under test, resolved from the PATH at spawn time (install it
-/// with install.sh).
+/// Compiler under test, resolved from PATH at spawn time (install with
+/// install.sh).
 const hcc = "hcc";
 
 /// Scratch dir for the compiled fixture executables: deterministic, inside
@@ -54,7 +54,7 @@ pub fn main(init: std.process.Init) !void {
 
     var args = std.process.Args.Iterator.init(init.minimal.args);
     _ = args.next(); // argv[0]
-    const testdata_dir = args.next() orelse {
+    const benchmarks_dir = args.next() orelse {
         try stderr.writeAll(usage);
         try stderr.flush();
         std.process.exit(2);
@@ -65,8 +65,8 @@ pub fn main(init: std.process.Init) !void {
     const a = arena_state.allocator();
 
     const cwd = std.Io.Dir.cwd();
-    var dir = cwd.openDir(io, testdata_dir, .{ .iterate = true }) catch |e| {
-        try stderr.print("bench: cannot open testdata dir {s}: {s}\n", .{ testdata_dir, @errorName(e) });
+    var dir = cwd.openDir(io, benchmarks_dir, .{ .iterate = true }) catch |e| {
+        try stderr.print("bench: cannot open benchmarks dir {s}: {s}\n", .{ benchmarks_dir, @errorName(e) });
         try stderr.flush();
         std.process.exit(2);
     };
@@ -94,11 +94,18 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     if (stems.items.len == 0) {
-        try stderr.print("bench: no .HC/.c fixture pairs found in {s}\n", .{testdata_dir});
+        try stderr.print("bench: no .HC/.c fixture pairs found in {s}\n", .{benchmarks_dir});
         try stderr.flush();
         std.process.exit(2);
     }
     std.mem.sort([]const u8, stems.items, {}, stringLessThan);
+
+    // The target both compilers build for. Neither is cross-compiling (no
+    // --target / -target is passed), so both target the host; clang's
+    // -dumpmachine is the authoritative triple for that machine.
+    const target = try hostTriple(a, io);
+    try stderr.print("bench: target {s} (host)\n", .{target});
+    try stderr.flush();
 
     cwd.deleteTree(io, tmp_dir_path) catch {};
     try cwd.createDirPath(io, tmp_dir_path);
@@ -109,8 +116,8 @@ pub fn main(init: std.process.Init) !void {
         try stderr.print("bench: {s}\n", .{stem});
         try stderr.flush();
 
-        const hc_src = try std.fs.path.join(a, &.{ testdata_dir, try std.fmt.allocPrint(a, "{s}.HC", .{stem}) });
-        const c_src = try std.fs.path.join(a, &.{ testdata_dir, try std.fmt.allocPrint(a, "{s}.c", .{stem}) });
+        const hc_src = try std.fs.path.join(a, &.{ benchmarks_dir, try std.fmt.allocPrint(a, "{s}.HC", .{stem}) });
+        const c_src = try std.fs.path.join(a, &.{ benchmarks_dir, try std.fmt.allocPrint(a, "{s}.c", .{stem}) });
 
         var row: Row = .{ .name = stem, .compile_ms = undefined, .exec_ms = undefined };
 
@@ -128,6 +135,7 @@ pub fn main(init: std.process.Init) !void {
         try rows.append(a, row);
     }
 
+    try stdout.print("target: {s} (host; hcc and clang default, no cross-compile)\n\n", .{target});
     try printTable(stdout, "Compile time", compile_runs, rows.items, .compile);
     try stdout.writeAll("\n");
     try printTable(stdout, "Execution time", exec_runs, rows.items, .exec);
@@ -136,6 +144,23 @@ pub fn main(init: std.process.Init) !void {
 
 fn stringLessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
     return std.mem.lessThan(u8, lhs, rhs);
+}
+
+/// The host target triple both compilers build for, from `clang -dumpmachine`
+/// (clang is already required for the C side). Falls back to "unknown" if
+/// clang cannot be queried.
+fn hostTriple(a: std.mem.Allocator, io: std.Io) ![]const u8 {
+    const result = std.process.run(a, io, .{
+        .argv = &.{ "clang", "-dumpmachine" },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    }) catch return "unknown";
+    const ok = switch (result.term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+    if (!ok) return "unknown";
+    return std.mem.trim(u8, result.stdout, " \t\r\n");
 }
 
 /// Runs argv once untimed (warmup), then `runs` more times, and returns the
@@ -193,7 +218,7 @@ fn printTable(
     rows: []const Row,
     which: enum { exec, compile },
 ) !void {
-    try w.print("{s} (mean of {d} runs, ms; ratio is clang/hcc — above 1.00x clang is slower)\n", .{ title, runs });
+    try w.print("{s} (mean of {d} runs, ms; ratio is hcc/clang — above 1.00x hcc is slower)\n", .{ title, runs });
 
     var name_w: usize = "fixture".len;
     for (rows) |row| name_w = @max(name_w, row.name.len);
@@ -218,7 +243,7 @@ fn printTable(
         try w.print("  {d:>10.2}", .{ms[0]});
         for (ms[1..]) |v| {
             var buf: [32]u8 = undefined;
-            const cell = try std.fmt.bufPrint(&buf, "{d:.2} ({d:.2}x)", .{ v, v / ms[0] });
+            const cell = try std.fmt.bufPrint(&buf, "{d:.2} ({d:.2}x)", .{ v, ms[0] / v });
             try w.print("  {s:>[1]}", .{ cell, clang_w });
         }
         try w.writeAll("\n");

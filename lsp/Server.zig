@@ -1,13 +1,12 @@
 //! The HolyC language server: JSON-RPC 2.0 over LSP base-protocol framing,
 //! driven by the hcc compiler front end (without its LLVM backend).
 //!
-//! The transport is abstract — the server reads frames from any
-//! *std.Io.Reader and writes to any *std.Io.Writer — so main.zig binds it to
-//! stdin/stdout and tests bind it to in-memory streams. Nothing but protocol
-//! frames is ever written to `out`; incidental logging goes to stderr.
+//! The transport is abstract: the server reads frames from any *std.Io.Reader
+//! and writes to any *std.Io.Writer, so main.zig binds it to stdin/stdout and
+//! tests bind it to in-memory streams. Nothing but protocol frames is written
+//! to `out`; logging goes to stderr.
 //!
-//! Protocol subset (deliberate simplifications, mirrored in the initialize
-//! capabilities):
+//! Protocol subset (mirrored in the initialize capabilities):
 //!   - textDocumentSync = 1 (full): every didChange replaces the whole text.
 //!   - Positions count bytes, not UTF-16 code units (HolyC sources are ASCII;
 //!     see position.zig).
@@ -20,13 +19,32 @@ const hcc = @import("hcc");
 const framing = @import("framing.zig");
 const uri_util = @import("uri.zig");
 const position = @import("position.zig");
+const nav = @import("nav.zig");
 
 gpa: std.mem.Allocator,
 io: std.Io,
 in: *std.Io.Reader,
 out: *std.Io.Writer,
+/// Ordered angle-bracket #include <...> search path (HCC_PATH/pkg, HCC_ROOT/std),
+/// so analysis resolves standard-library and package includes like hcc.
+/// Set by main after init; empty means std/pkg includes will not resolve.
+include_path: []const []const u8 = &.{},
 /// uri → open document. Keys and texts are gpa-owned.
 docs: std.StringArrayHashMapUnmanaged(Document) = .empty,
+/// Directory the embedded prelude is extracted into (`<HCC_ROOT>/.cache/core`)
+/// so go-to-definition can jump into it. gpa-owned; set by main. Null disables
+/// go-to-definition into the prelude.
+core_cache_dir: ?[]const u8 = null,
+/// Whether the prelude has been written to core_cache_dir this session.
+core_extracted: bool = false,
+/// The workspace root path (gpa-owned), or null in single-file mode. When set,
+/// the server scans it for HolyC files and maintains ws_defs for cross-file
+/// go-to-definition.
+root: ?[]u8 = null,
+/// uri → that file's top-level definitions and identifier uses, backing
+/// cross-file go-to-definition and find-references (for files the user has not
+/// opened). Keys are gpa-owned; each value owns an arena holding its names.
+ws_defs: std.StringArrayHashMapUnmanaged(FileIndex) = .empty,
 shutdown_requested: bool = false,
 /// Set by the exit notification; run() returns it.
 exit_code: ?u8 = null,
@@ -61,13 +79,32 @@ const Analysis = struct {
     arena: *std.heap.ArenaAllocator,
     /// The text snapshot the program was built from (arena-owned). AST spans
     /// are byte ranges into this, and identifier slices point into it, so it
-    /// must outlive `program` — hence it lives in the same arena.
+    /// must outlive `program`, hence the same arena.
     src: []const u8,
     program: hcc.ast.Program,
+    /// The source-file table (indexed by span.file), arena-owned. Maps a
+    /// non-zero file id (the prelude and #includes) to its FileInfo, so
+    /// go-to-definition can resolve a declaration back to its origin file.
+    files: []const hcc.source.FileInfo,
 
     fn deinit(a: Analysis, gpa: std.mem.Allocator) void {
         a.arena.deinit();
         gpa.destroy(a.arena);
+    }
+};
+
+/// One file's contribution to the workspace index: its top-level declarations
+/// (for cross-file go-to-definition) and its bare-identifier uses (for
+/// cross-file find-references). The arena owns the name strings (ranges are
+/// plain values), so a file can be re-indexed by swapping the whole struct.
+const FileIndex = struct {
+    arena: *std.heap.ArenaAllocator,
+    defs: []const nav.Def,
+    uses: []const nav.Use,
+
+    fn deinit(fi: FileIndex, gpa: std.mem.Allocator) void {
+        fi.arena.deinit();
+        gpa.destroy(fi.arena);
     }
 };
 
@@ -84,6 +121,13 @@ pub fn deinit(s: *Server) void {
         if (doc.analysis) |a| a.deinit(s.gpa);
     }
     s.docs.deinit(s.gpa);
+    for (s.ws_defs.keys(), s.ws_defs.values()) |key, fi| {
+        s.gpa.free(key);
+        fi.deinit(s.gpa);
+    }
+    s.ws_defs.deinit(s.gpa);
+    if (s.root) |r| s.gpa.free(r);
+    if (s.core_cache_dir) |d| s.gpa.free(d);
 }
 
 /// The message loop: runs until the exit notification or end of stream.
@@ -133,7 +177,7 @@ fn handleMessage(s: *Server, body: []const u8) Error!void {
     if (id) |id_val| {
         // Requests: everything else is answered, even when unknown.
         if (std.mem.eql(u8, method, "initialize")) {
-            try s.replyInitialize(id_val);
+            try s.handleInitialize(id_val, params);
         } else if (std.mem.eql(u8, method, "shutdown")) {
             s.shutdown_requested = true;
             try s.replyNull(id_val);
@@ -141,6 +185,10 @@ fn handleMessage(s: *Server, body: []const u8) Error!void {
             try s.replyDocumentSymbol(id_val, params);
         } else if (std.mem.eql(u8, method, "textDocument/hover")) {
             try s.replyHover(id_val, params);
+        } else if (std.mem.eql(u8, method, "textDocument/definition")) {
+            try s.replyDefinition(id_val, params);
+        } else if (std.mem.eql(u8, method, "textDocument/references")) {
+            try s.replyReferences(id_val, params);
         } else {
             try s.sendError(id_val, ErrorCode.method_not_found, method);
         }
@@ -280,7 +328,7 @@ fn writeSpanRange(jw: *std.json.Stringify, src: []const u8, span: hcc.source.Spa
 
 // ---- lifecycle ----
 
-fn replyInitialize(s: *Server, id: std.json.Value) error{WriteFailed}!void {
+fn handleInitialize(s: *Server, id: std.json.Value, params: std.json.Value) Error!void {
     var m = s.beginMessage();
     defer m.deinit();
     try m.beginResponse(id);
@@ -293,6 +341,10 @@ fn replyInitialize(s: *Server, id: std.json.Value) error{WriteFailed}!void {
     try m.jw.write(true);
     try m.jw.objectField("hoverProvider");
     try m.jw.write(true);
+    try m.jw.objectField("definitionProvider");
+    try m.jw.write(true);
+    try m.jw.objectField("referencesProvider");
+    try m.jw.write(true);
     try m.jw.endObject();
     try m.jw.objectField("serverInfo");
     try m.jw.beginObject();
@@ -301,6 +353,22 @@ fn replyInitialize(s: *Server, id: std.json.Value) error{WriteFailed}!void {
     try m.jw.endObject();
     try m.jw.endObject();
     try s.send(&m);
+
+    // Answer initialize first (so the client sees capabilities promptly), then
+    // build the cross-file definition index. Best-effort: absent/odd params or
+    // an unreadable tree leave the workspace index empty.
+    try s.setupWorkspace(params);
+}
+
+/// Records the workspace root from the initialize params (rootUri preferred over
+/// the deprecated rootPath) and scans it for the cross-file definition index.
+fn setupWorkspace(s: *Server, params: std.json.Value) Error!void {
+    if (getString(params, "rootUri")) |root_uri| {
+        s.root = (uri_util.filePath(s.gpa, root_uri) catch return) orelse null;
+    } else if (getString(params, "rootPath")) |root_path| {
+        s.root = try s.gpa.dupe(u8, root_path);
+    }
+    if (s.root) |root| try s.indexWorkspace(root);
 }
 
 // ---- document synchronization ----
@@ -333,6 +401,15 @@ fn handleDidClose(s: *Server, params: std.json.Value) Error!void {
         s.gpa.free(kv.value.text);
         if (kv.value.analysis) |a| a.deinit(s.gpa);
     }
+    // The buffer's live definitions are gone; fall back to the saved file on
+    // disk so cross-file navigation keeps working (and drops unsaved edits).
+    if (s.root != null) {
+        s.wsRemove(uri);
+        if (uri_util.filePath(s.gpa, uri) catch null) |path| {
+            defer s.gpa.free(path);
+            s.wsIndexPath(path) catch {};
+        }
+    }
     // Clear the document's diagnostics in the editor.
     var m = s.beginMessage();
     defer m.deinit();
@@ -363,6 +440,43 @@ fn upsertText(s: *Server, uri: []const u8, text: []const u8) error{OutOfMemory}!
     return s.docs.getPtr(uri_copy).?;
 }
 
+/// Builds the ordered angle-bracket #include <...> search path: $HCC_PATH/pkg
+/// (third-party packages) then $HCC_ROOT/std (the standard library), the same
+/// resolution hcc uses minus the compiler's -I dirs. HCC_ROOT defaults to the
+/// parent of the running binary's directory (so bin/holyc-lsp yields the
+/// toolchain root beside bin/std), and HCC_PATH defaults to HCC_ROOT. Both env
+/// vars override; an unresolvable root is skipped. `env` is anything with a
+/// `get(key) ?[]const u8` (the process environment map).
+pub fn computeIncludePath(arena: std.mem.Allocator, io: std.Io, env: anytype) error{OutOfMemory}![]const []const u8 {
+    var path: std.ArrayList([]const u8) = .empty;
+    const hcc_root = resolveRoot(arena, io, env);
+    const hcc_path: ?[]const u8 = env.get("HCC_PATH") orelse hcc_root;
+    if (hcc_path) |hp| try path.append(arena, try std.fs.path.join(arena, &.{ hp, "pkg" }));
+    if (hcc_root) |hr| try path.append(arena, try std.fs.path.join(arena, &.{ hr, "std" }));
+    return path.items;
+}
+
+/// The toolchain root: $HCC_ROOT, else the parent of the running binary's
+/// directory (bin/holyc-lsp yields the tree beside bin/), else null.
+fn resolveRoot(arena: std.mem.Allocator, io: std.Io, env: anytype) ?[]const u8 {
+    return env.get("HCC_ROOT") orelse blk: {
+        const bindir = std.process.executableDirPathAlloc(io, arena) catch break :blk null;
+        break :blk std.fs.path.dirname(bindir);
+    };
+}
+
+/// Where to extract the embedded prelude for go-to-definition into it:
+/// `<HCC_ROOT>/.cache/core`. Returned gpa-owned (lives for the server), or null
+/// when the root cannot be resolved. Set onto `core_cache_dir` by main.
+pub fn coreCacheDir(gpa: std.mem.Allocator, io: std.Io, env: anytype) ?[]u8 {
+    var tmp = std.heap.ArenaAllocator.init(gpa);
+    defer tmp.deinit();
+    const a = tmp.allocator();
+    const root = resolveRoot(a, io, env) orelse return null;
+    const dir = std.fs.path.join(a, &.{ root, ".cache", "core" }) catch return null;
+    return gpa.dupe(u8, dir) catch null;
+}
+
 // ---- analysis and diagnostics ----
 
 /// Runs the front end over the document and publishes diagnostics. On
@@ -391,10 +505,15 @@ fn analyzeAndPublish(s: *Server, uri: []const u8, doc: *Document) Error!void {
 
     var diags = hcc.diag.Diagnostics.init(arena);
     var files: []const hcc.source.FileInfo = &.{};
+    // No exe_runner is passed: running an #exe block needs the LLVM backend,
+    // which the server never links. The frontend skips #exe blocks when no
+    // executor is present, so a file using #exe still analyzes (its
+    // compile-time-generated code is not visible to the editor).
     const result: ?hcc.frontend.Result = hcc.frontend.run(arena, &diags, s.io, src, .{
         .base_dir = base_dir,
         .target = hcc.target.Target.host(),
         .inject_prelude = true,
+        .include_path = s.include_path,
         .files_out = &files,
     }) catch |e| switch (e) {
         error.CompileFailed => null,
@@ -405,8 +524,11 @@ fn analyzeAndPublish(s: *Server, uri: []const u8, doc: *Document) Error!void {
 
     if (result) |res| {
         if (doc.analysis) |old| old.deinit(s.gpa);
-        doc.analysis = .{ .arena = arena_ptr, .src = src, .program = res.program };
+        doc.analysis = .{ .arena = arena_ptr, .src = src, .program = res.program, .files = files };
         keep = true;
+        // Keep the cross-file index in step with the live buffer (best-effort:
+        // an index-update OOM must not fail the diagnostics publish).
+        if (s.root != null) s.wsUpdateDoc(uri, doc.analysis.?) catch {};
     }
 }
 
@@ -459,6 +581,303 @@ fn publishDiagnostics(
     }
     try m.jw.endArray();
     try m.jw.endObject();
+    try s.send(&m);
+}
+
+// ---- workspace definition index ----
+
+/// Whether name ends in a HolyC extension (.HC or .hc).
+fn isHolyCFile(name: []const u8) bool {
+    return std.mem.endsWith(u8, name, ".HC") or std.mem.endsWith(u8, name, ".hc");
+}
+
+/// Whether a workspace-relative path passes through a directory the scan skips:
+/// hidden directories (.git and friends) and common dependency/build output.
+fn pathHasSkippedDir(path: []const u8) bool {
+    var it = std.mem.splitScalar(u8, path, std.fs.path.sep);
+    while (it.next()) |seg| {
+        if (seg.len == 0) continue;
+        if (seg[0] == '.') return true;
+        if (std.mem.eql(u8, seg, "node_modules") or std.mem.eql(u8, seg, "zig-out") or
+            std.mem.eql(u8, seg, "target") or std.mem.eql(u8, seg, "build")) return true;
+    }
+    return false;
+}
+
+/// Walks the workspace root and indexes every HolyC file's top-level
+/// definitions. Unreadable entries and files that do not parse standalone are
+/// skipped; a file cap bounds pathological trees.
+fn indexWorkspace(s: *Server, root: []const u8) Error!void {
+    var dir = std.Io.Dir.openDirAbsolute(s.io, root, .{ .iterate = true }) catch return;
+    defer dir.close(s.io);
+    var walker = dir.walk(s.gpa) catch return;
+    defer walker.deinit();
+
+    const max_files = 5000;
+    var indexed: usize = 0;
+    while (walker.next(s.io) catch null) |entry| {
+        if (entry.kind != .file or !isHolyCFile(entry.basename)) continue;
+        if (pathHasSkippedDir(entry.path)) continue;
+        if (indexed >= max_files) break;
+        const abs = std.fs.path.join(s.gpa, &.{ root, entry.path }) catch continue;
+        defer s.gpa.free(abs);
+        s.wsIndexPath(abs) catch {};
+        indexed += 1;
+    }
+}
+
+/// Reads one file from disk, analyses it standalone, and records its top-level
+/// definitions under its file:// URI. Any read/parse failure leaves the index
+/// unchanged for that file.
+fn wsIndexPath(s: *Server, abs_path: []const u8) Error!void {
+    var tmp_state = std.heap.ArenaAllocator.init(s.gpa);
+    defer tmp_state.deinit();
+    const tmp = tmp_state.allocator();
+
+    const src = std.Io.Dir.cwd().readFileAlloc(s.io, abs_path, tmp, .limited(16 << 20)) catch return;
+    var diags = hcc.diag.Diagnostics.init(tmp);
+    const base_dir = std.fs.path.dirname(abs_path) orelse ".";
+    const res = hcc.frontend.run(tmp, &diags, s.io, src, .{
+        .base_dir = base_dir,
+        .target = hcc.target.Target.host(),
+        .inject_prelude = true,
+        .include_path = s.include_path,
+    }) catch return;
+
+    const uri = try nav.pathToUri(s.gpa, abs_path);
+    try s.wsUpsert(uri, src, res.program.items);
+}
+
+/// Updates the open document's entry in the index from its live analysis, so
+/// other files' go-to-definition reflects unsaved edits here.
+fn wsUpdateDoc(s: *Server, uri: []const u8, analysis: Analysis) Error!void {
+    const uri_copy = try s.gpa.dupe(u8, uri);
+    try s.wsUpsert(uri_copy, analysis.src, analysis.program.items);
+}
+
+/// Stores uri_owned's definitions, replacing any prior entry. Takes ownership of
+/// uri_owned: it is stored as the map key, or freed when the key already exists
+/// or the update is dropped. Best-effort: an allocation failure while building
+/// the entry drops it rather than propagating.
+fn wsUpsert(s: *Server, uri_owned: []u8, src: []const u8, items: []const *hcc.ast.Stmt) error{OutOfMemory}!void {
+    errdefer s.gpa.free(uri_owned); // only on the create-failure path below
+    const arena_ptr = try s.gpa.create(std.heap.ArenaAllocator);
+    arena_ptr.* = std.heap.ArenaAllocator.init(s.gpa);
+
+    const arena = arena_ptr.allocator();
+    var fi = FileIndex{ .arena = arena_ptr, .defs = &.{}, .uses = &.{} };
+    fi.defs = nav.collectDefs(arena, src, items) catch return s.wsDrop(fi, uri_owned);
+    fi.uses = nav.collectUses(arena, src, items) catch return s.wsDrop(fi, uri_owned);
+
+    if (s.ws_defs.getPtr(uri_owned)) |old| {
+        old.deinit(s.gpa);
+        old.* = fi;
+        s.gpa.free(uri_owned); // key already stored; drop the duplicate
+    } else {
+        s.ws_defs.put(s.gpa, uri_owned, fi) catch return s.wsDrop(fi, uri_owned);
+    }
+}
+
+/// Discards a half-built index entry and its key (used when indexing a file
+/// runs out of memory; the file is left unindexed).
+fn wsDrop(s: *Server, fi: FileIndex, uri_owned: []u8) void {
+    fi.deinit(s.gpa);
+    s.gpa.free(uri_owned);
+}
+
+/// Forgets uri's definitions.
+fn wsRemove(s: *Server, uri: []const u8) void {
+    if (s.ws_defs.fetchSwapRemove(uri)) |kv| {
+        s.gpa.free(kv.key);
+        kv.value.deinit(s.gpa);
+    }
+}
+
+// ---- textDocument/definition & textDocument/references ----
+
+/// A cross-file definition candidate: the URI of the declaring file (borrowed
+/// from the index key) and the name's range within it.
+const WsMatch = struct { uri: []const u8, range: nav.Range };
+
+fn lessByUri(_: void, a: WsMatch, b: WsMatch) bool {
+    return std.mem.lessThan(u8, a.uri, b.uri);
+}
+
+/// Writes a Location object {uri, range}.
+fn writeLoc(jw: *std.json.Stringify, uri: []const u8, range: nav.Range) error{WriteFailed}!void {
+    try jw.beginObject();
+    try jw.objectField("uri");
+    try jw.write(uri);
+    try jw.objectField("range");
+    try writeRange(jw, range.start, range.end);
+    try jw.endObject();
+}
+
+/// Extracts the embedded prelude to core_cache_dir once per session, so a
+/// go-to-definition into the prelude has a real file to point at. Returns the
+/// directory on success, or null when disabled (no cache dir) or the write
+/// fails, in which case prelude navigation is skipped. Overwrites each session
+/// so the cache always matches this binary's embedded core.
+fn ensureCoreExtracted(s: *Server) ?[]const u8 {
+    const dir = s.core_cache_dir orelse return null;
+    if (s.core_extracted) return dir;
+    const cwd = std.Io.Dir.cwd();
+    cwd.createDirPath(s.io, dir) catch return null;
+    for (hcc.core.files) |f| {
+        const full = std.fs.path.join(s.gpa, &.{ dir, f.path }) catch return null;
+        defer s.gpa.free(full);
+        if (std.fs.path.dirname(full)) |parent| cwd.createDirPath(s.io, parent) catch {};
+        cwd.writeFile(s.io, .{ .sub_path = full, .data = f.contents }) catch return null;
+    }
+    s.core_extracted = true;
+    return dir;
+}
+
+/// Answers go-to-definition. A declaration in the same file wins (precise, and
+/// reflecting unsaved edits); then the embedded prelude (jumping into an
+/// extracted copy of its source); otherwise the workspace index is consulted so
+/// the jump can cross files. Replies null when the cursor is already on the
+/// declaration (so the editor falls back to find-all-references) or when there
+/// is nothing to jump to.
+fn replyDefinition(s: *Server, id: std.json.Value, params: std.json.Value) Error!void {
+    const uri = getString(get(params, "textDocument") orelse .null, "uri") orelse return s.replyNull(id);
+    const doc = s.docs.getPtr(uri) orelse return s.replyNull(id);
+    const pos_val = get(params, "position") orelse return s.replyNull(id);
+    const pos: position.Position = .{
+        .line = getU32(pos_val, "line") orelse return s.replyNull(id),
+        .character = getU32(pos_val, "character") orelse return s.replyNull(id),
+    };
+
+    // The cursor word comes from the live buffer, so navigation still works when
+    // the current text does not parse (e.g. an include-fragment opened alone):
+    // the same-file lookup below is skipped, but cross-file still resolves.
+    const text = doc.text;
+    const offset = position.positionToOffset(text, pos);
+    const word = nav.wordAt(text, offset);
+    if (word.len == 0) return s.replyNull(id);
+
+    // Same-file declaration wins, when the buffer has a good parse to search.
+    if (doc.analysis) |analysis| {
+        if (nav.findDef(analysis.src, analysis.program.items, word)) |off| {
+            // Already on the declaration: yield null so the editor falls back to
+            // find-all-references.
+            if (off.start <= offset and offset <= off.end) return s.replyNull(id);
+            var m = s.beginMessage();
+            defer m.deinit();
+            try m.beginResponse(id);
+            try writeLoc(&m.jw, uri, nav.rangeFromOffsets(analysis.src, off));
+            return s.send(&m);
+        }
+        // Then the embedded prelude: jump into an extracted copy of its source.
+        if (nav.findPreludeDef(analysis.program.items, analysis.files, word)) |pd| {
+            if (s.ensureCoreExtracted()) |dir| {
+                var sa = std.heap.ArenaAllocator.init(s.gpa);
+                defer sa.deinit();
+                const a = sa.allocator();
+                const path = try std.fs.path.join(a, &.{ dir, pd.core_name });
+                const loc_uri = try nav.pathToUri(a, path);
+                var m = s.beginMessage();
+                defer m.deinit();
+                try m.beginResponse(id);
+                try writeLoc(&m.jw, loc_uri, pd.range);
+                return s.send(&m);
+            }
+        }
+    }
+
+    // Otherwise, a definition in another workspace file.
+    var scratch_state = std.heap.ArenaAllocator.init(s.gpa);
+    defer scratch_state.deinit();
+    const scratch = scratch_state.allocator();
+
+    var matches: std.ArrayList(WsMatch) = .empty;
+    for (s.ws_defs.keys(), s.ws_defs.values()) |key, fd| {
+        if (std.mem.eql(u8, key, uri)) continue;
+        for (fd.defs) |d| {
+            if (std.mem.eql(u8, d.name, word)) try matches.append(scratch, .{ .uri = key, .range = d.range });
+        }
+    }
+    if (matches.items.len == 0) return s.replyNull(id);
+    std.mem.sort(WsMatch, matches.items, {}, lessByUri);
+
+    var m = s.beginMessage();
+    defer m.deinit();
+    try m.beginResponse(id);
+    if (matches.items.len == 1) {
+        try writeLoc(&m.jw, matches.items[0].uri, matches.items[0].range);
+    } else {
+        try m.jw.beginArray();
+        for (matches.items) |match| try writeLoc(&m.jw, match.uri, match.range);
+        try m.jw.endArray();
+    }
+    return s.send(&m);
+}
+
+/// Answers find-all-references: every bare-identifier use of the word under the
+/// cursor across the workspace, plus the declaration when the client asks for
+/// it. The current file's uses come from its live parse; other files' from the
+/// workspace index. Always a list (empty, never null).
+fn replyReferences(s: *Server, id: std.json.Value, params: std.json.Value) Error!void {
+    const uri = getString(get(params, "textDocument") orelse .null, "uri") orelse return s.replyEmptyArray(id);
+    const doc = s.docs.getPtr(uri) orelse return s.replyEmptyArray(id);
+    const pos_val = get(params, "position") orelse return s.replyEmptyArray(id);
+    const pos: position.Position = .{
+        .line = getU32(pos_val, "line") orelse return s.replyEmptyArray(id),
+        .character = getU32(pos_val, "character") orelse return s.replyEmptyArray(id),
+    };
+    const include_decl = blk: {
+        const ctx = get(params, "context") orelse break :blk false;
+        const inc = get(ctx, "includeDeclaration") orelse break :blk false;
+        break :blk inc == .bool and inc.bool;
+    };
+
+    // The cursor word comes from the live buffer, so a just-typed use resolves.
+    const word = nav.wordAt(doc.text, position.positionToOffset(doc.text, pos));
+
+    var scratch_state = std.heap.ArenaAllocator.init(s.gpa);
+    defer scratch_state.deinit();
+    const scratch = scratch_state.allocator();
+
+    var m = s.beginMessage();
+    defer m.deinit();
+    try m.beginResponse(id);
+    try m.jw.beginArray();
+    if (word.len > 0) {
+        // Current file: read from the live parse (fresh, and works without a
+        // workspace root).
+        if (doc.analysis) |analysis| {
+            if (include_decl) {
+                if (nav.findDef(analysis.src, analysis.program.items, word)) |off| {
+                    try writeLoc(&m.jw, uri, nav.rangeFromOffsets(analysis.src, off));
+                }
+            }
+            const refs = nav.collectRefs(scratch, analysis.src, analysis.program.items, word) catch &.{};
+            for (refs) |r| try writeLoc(&m.jw, uri, r);
+        }
+        // Every other workspace file: from the index.
+        for (s.ws_defs.keys(), s.ws_defs.values()) |key, fi| {
+            if (std.mem.eql(u8, key, uri)) continue;
+            if (include_decl) {
+                for (fi.defs) |d| {
+                    if (std.mem.eql(u8, d.name, word)) try writeLoc(&m.jw, key, d.range);
+                }
+            }
+            for (fi.uses) |u| {
+                if (std.mem.eql(u8, u.name, word)) try writeLoc(&m.jw, key, u.range);
+            }
+        }
+    }
+    try m.jw.endArray();
+    return s.send(&m);
+}
+
+/// Replies with an empty JSON array.
+fn replyEmptyArray(s: *Server, id: std.json.Value) error{WriteFailed}!void {
+    var m = s.beginMessage();
+    defer m.deinit();
+    try m.beginResponse(id);
+    try m.jw.beginArray();
+    try m.jw.endArray();
     try s.send(&m);
 }
 
@@ -587,7 +1006,13 @@ fn replyHover(s: *Server, id: std.json.Value, params: std.json.Value) Error!void
         .ident => |name| try std.fmt.allocPrint(scratch, "{s}: {s}", .{ name, ty_str }),
         else => ty_str,
     };
-    const value = try std.fmt.allocPrint(scratch, "```holyc\n{s}\n```", .{text});
+    // Annotate when the symbol under the cursor is declared in the implicit prelude.
+    var origin: []const u8 = "";
+    if (expr.kind == .ident) {
+        if (nav.findPreludeDef(analysis.program.items, analysis.files, expr.kind.ident)) |pd|
+            origin = try std.fmt.allocPrint(scratch, "\n\n*from `{s}` (prelude)*", .{pd.core_name});
+    }
+    const value = try std.fmt.allocPrint(scratch, "```holyc\n{s}\n```{s}", .{ text, origin });
 
     var m = s.beginMessage();
     defer m.deinit();

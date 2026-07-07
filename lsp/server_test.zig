@@ -202,6 +202,138 @@ test "end-to-end session: lifecycle, diagnostics, symbols, hover" {
     }
 }
 
+fn byId(msgs: []std.json.Value, want: i64) std.json.Value {
+    for (msgs) |m| {
+        if (getInt(m, "id") == want) return m;
+    }
+    return .null;
+}
+
+test "definition jumps to the declaration; on the declaration it yields null (references fallback)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Decoded text (Sum declared on line 0 cols 3..6, called on lines 2 and 4):
+    //   U0 Sum()
+    //   {
+    //     Sum();
+    //   }
+    //   Sum();
+    const session = try runSession(arena, &.{
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}
+        ,
+        \\{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///t.HC","languageId":"holyc","version":1,"text":"U0 Sum()\n{\n  Sum();\n}\nSum();"}}}
+        ,
+        // definition on the call (line 4) → jumps to the declaration.
+        \\{"jsonrpc":"2.0","id":2,"method":"textDocument/definition","params":{"textDocument":{"uri":"file:///t.HC"},"position":{"line":4,"character":1}}}
+        ,
+        // definition on the declaration name (line 0) → null.
+        \\{"jsonrpc":"2.0","id":3,"method":"textDocument/definition","params":{"textDocument":{"uri":"file:///t.HC"},"position":{"line":0,"character":4}}}
+        ,
+        // references on the call, including the declaration.
+        \\{"jsonrpc":"2.0","id":4,"method":"textDocument/references","params":{"textDocument":{"uri":"file:///t.HC"},"position":{"line":4,"character":1},"context":{"includeDeclaration":true}}}
+        ,
+        \\{"jsonrpc":"2.0","id":9,"method":"shutdown"}
+        ,
+        \\{"jsonrpc":"2.0","method":"exit"}
+        ,
+    });
+    try std.testing.expectEqual(0, session.code);
+    const msgs = session.msgs;
+
+    // Capabilities advertise the new providers.
+    const caps = get(get(byId(msgs, 1), "result"), "capabilities");
+    try std.testing.expect(get(caps, "definitionProvider").bool);
+    try std.testing.expect(get(caps, "referencesProvider").bool);
+
+    // Definition on the call → Location on the declaration name (line 0, 3..6).
+    {
+        const loc = get(byId(msgs, 2), "result");
+        try std.testing.expectEqualStrings("file:///t.HC", getStr(loc, "uri"));
+        const start = get(get(loc, "range"), "start");
+        try std.testing.expectEqual(0, getInt(start, "line"));
+        try std.testing.expectEqual(3, getInt(start, "character"));
+        try std.testing.expectEqual(6, getInt(get(get(loc, "range"), "end"), "character"));
+    }
+
+    // Definition on the declaration itself → null (so the editor shows references).
+    try std.testing.expect(get(byId(msgs, 3), "result") == .null);
+
+    // References (with declaration) → the decl on line 0 plus the two calls.
+    {
+        const refs = items(get(byId(msgs, 4), "result"));
+        try std.testing.expectEqual(3, refs.len);
+        var saw = [_]bool{ false, false, false }; // lines 0, 2, 4
+        for (refs) |r| {
+            const line = getInt(get(get(r, "range"), "start"), "line");
+            switch (line) {
+                0 => saw[0] = true,
+                2 => saw[1] = true,
+                4 => saw[2] = true,
+                else => return error.UnexpectedReferenceLine,
+            }
+        }
+        try std.testing.expect(saw[0] and saw[1] and saw[2]);
+    }
+}
+
+test "definition on a prelude symbol jumps into the extracted core cache" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    const cache_dir = "/tmp/holyc-lsp-test-core";
+    const cwd = std.Io.Dir.cwd();
+    cwd.deleteTree(io, cache_dir) catch {};
+    defer cwd.deleteTree(io, cache_dir) catch {};
+
+    // FltToBits (declared in the prelude's StrPrint.HC) starts at column 17 of
+    // the body below; the cursor at column 20 sits inside it.
+    const bodies = [_][]const u8{
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}
+        ,
+        \\{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///t.HC","languageId":"holyc","version":1,"text":"U0 M() { I64 x = FltToBits(1.0); }"}}}
+        ,
+        \\{"jsonrpc":"2.0","id":2,"method":"textDocument/definition","params":{"textDocument":{"uri":"file:///t.HC"},"position":{"line":0,"character":20}}}
+        ,
+        \\{"jsonrpc":"2.0","id":9,"method":"shutdown"}
+        ,
+        \\{"jsonrpc":"2.0","method":"exit"}
+        ,
+    };
+
+    var input: std.Io.Writer.Allocating = .init(gpa);
+    defer input.deinit();
+    for (bodies) |b| try framing.writeFrame(&input.writer, b);
+    var in_r = std.Io.Reader.fixed(input.written());
+    var out_w: std.Io.Writer.Allocating = .init(gpa);
+    defer out_w.deinit();
+
+    var server = Server.init(gpa, io, &in_r, &out_w.writer);
+    server.core_cache_dir = try gpa.dupe(u8, cache_dir); // freed by server.deinit
+    defer server.deinit();
+    try std.testing.expectEqual(0, try server.run());
+
+    var msgs: std.ArrayList(std.json.Value) = .empty;
+    var out_r = std.Io.Reader.fixed(out_w.written());
+    while (true) {
+        const body = framing.readFrame(&out_r, arena) catch |e| switch (e) {
+            error.EndOfStream => break,
+            else => return e,
+        };
+        try msgs.append(arena, try std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{}));
+    }
+
+    // The jump lands in the extracted core file, and that file really exists.
+    const loc = get(byId(msgs.items, 2), "result");
+    try std.testing.expectEqualStrings("file:///tmp/holyc-lsp-test-core/StrPrint.HC", getStr(loc, "uri"));
+    const extracted = try cwd.readFileAlloc(io, cache_dir ++ "/StrPrint.HC", arena, .limited(1 << 20));
+    try std.testing.expect(std.mem.indexOf(u8, extracted, "FltToBits") != null);
+}
+
 test "malformed JSON body gets a ParseError response and the loop survives" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();

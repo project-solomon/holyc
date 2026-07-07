@@ -2,19 +2,25 @@
     .name = .holyc,
     .version = "0.1.0",
     .minimum_zig_version = "0.16.0",
-    // Everything `zig build` needs: the two compiler modules (hcc/), the
-    // language server (lsp/), and the test/bench harness roots the build
-    // graph references. Docs, fixtures' goldens, and install scripts ride
-    // along with their directories; CI/packaging files stay out.
+
+    // Generated once by the Zig toolchain; a globally unique package id that
+    // never changes (regenerate only when forking a still-maintained project).
+    .fingerprint = 0x67aeecdd1eb169ee, // Changing this has security and trust implications.
+
+    // The files a consumer of this package receives and that the content hash
+    // is computed over: the build script, the source trees (compiler, language
+    // server, and the test/bench harnesses), their fixtures, and the license.
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "hcc",
         "lsp",
-        "integration",
+        "std",
+        "e2e",
+        "golden",
         "bench",
+        "benchmarks",
         "LICENSE",
         "README.md",
     },
-    .fingerprint = 0x67aeecdde9a8386c,
 }

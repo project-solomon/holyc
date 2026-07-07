@@ -29,9 +29,9 @@ const layout = @import("layout.zig");
 const Oom = error{OutOfMemory};
 
 /// Resolves names and type-checks prog, annotating each Expr.ty in place.
-/// Every error found is recorded as a .sema diagnostic; warnings (sorted by
-/// position, so output is deterministic) never fail the compilation. It is
-/// the single public entry point for the sema pass.
+/// The single public entry point for the sema pass. Every error is recorded as
+/// a .sema diagnostic; warnings (sorted by position for deterministic output)
+/// never fail the compilation.
 pub fn check(arena: std.mem.Allocator, diags: *diag.Diagnostics, prog: *ast.Program) diag.Error!void {
     var a = Analyzer{ .arena = arena, .diags = diags };
     try a.run(prog);
@@ -830,7 +830,7 @@ const Analyzer = struct {
 
     fn checkReturn(a: *Analyzer, val: ?*ast.Expr, span: source.Span) Oom!void {
         if (!a.in_function) {
-            // A top-level return: just check the value if present.
+            // A top-level return: check the value if present.
             if (val) |v| _ = try a.checkExpr(v);
             return;
         }

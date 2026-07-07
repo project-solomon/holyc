@@ -1,6 +1,7 @@
 // POSIX threads + lock + atomics: 8 threads each do 10000 lock-guarded
 // increments and 10000 AtomicAdds. Any lost update means lock{} or the
 // atomics are broken, so the totals are deterministic.
+#include <Sync.HC> // Thread/Join + AtomicAdd
 I64 counter = 0;
 I64 acount = 0;
 

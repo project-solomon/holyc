@@ -1,7 +1,6 @@
 //! The HolyC AST: types, expressions, statements, declarations, inline-asm
 //! nodes, and the whole-program node. Nodes are arena-allocated and linked by
-//! pointer; each node's shape is an exhaustive `union(enum)` (the Go original
-//! used `any` kinds "enforced by convention, not the compiler").
+//! pointer; each node's shape is an exhaustive `union(enum)`.
 
 const std = @import("std");
 const source = @import("source.zig");
@@ -339,8 +338,8 @@ pub const Expr = struct {
                 }
                 return false;
             },
-            // Literals, ident, sizeof, offset: nothing to recurse into. (A
-            // sizeof's expression operand is deliberately not walked.)
+            // Literals, ident, sizeof, offset: nothing to recurse into. A
+            // sizeof's expression operand is not walked.
             else => return false,
         }
     }
@@ -778,9 +777,8 @@ pub const AsmMem = struct {
     disp_sym: []const u8 = "",
 };
 
-// The register vocabularies live in asm_regs.zig, one source shared with the
-// LLVM backend's constraint building; these re-exports keep the parser's and
-// sema's call sites stable.
+// Register vocabularies live in asm_regs.zig, shared with the LLVM backend's
+// constraint building; these re-exports keep parser and sema call sites stable.
 const asm_regs = @import("asm_regs.zig");
 
 /// The architecture labels an asm block may carry.

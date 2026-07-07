@@ -1,12 +1,10 @@
 //! Lowers the checked, laid-out HolyC AST to LLVM IR.
 //!
-//! This is the Zig/LLVM port of the retired Go compiler's lower.go: the
-//! semantic decisions (narrow-int promote-then-truncate, signedness of >>, /,
-//! % and relationals, pointer-arithmetic scaling, store/arg/return coercion,
-//! HolyC varargs, call-site default arguments, lastclass, switch machinery,
-//! setjmp/longjmp exceptions over the CTask context, implicit print, and the
-//! synthesized program entry) are preserved exactly; the mechanics differ in
-//! that we emit LLVM IR instead of a custom SSA IR.
+//! Semantic decisions handled here: narrow-int promote-then-truncate,
+//! signedness of >>, /, % and relationals, pointer-arithmetic scaling,
+//! store/arg/return coercion, HolyC varargs, call-site default arguments,
+//! lastclass, switch machinery, setjmp/longjmp exceptions over the CTask
+//! context, implicit print, and the synthesized program entry.
 //!
 //! Representation choices:
 //!   - Scalars: I8/U8=i8 … I64/U64=i64, F64=double, every pointer is the
@@ -19,8 +17,7 @@
 //!   - Every local (and parameter) lives in an alloca in the function's entry
 //!     block; LLVM's mem2reg (run as part of default<O2>) rebuilds SSA.
 //!   - Defined HolyC functions get internal linkage so whole-program DCE can
-//!     drop the unused parts of the always-resident prelude, mirroring the Go
-//!     compiler's PruneUnreachable.
+//!     drop the unused parts of the always-resident prelude.
 
 const std = @import("std");
 const c = @import("c.zig");
@@ -43,12 +40,12 @@ pub const Input = struct {
 };
 
 /// How the module is packaged. In .library mode (objects for separate
-/// compilation, shared libraries) `public` functions and globals defined in
-/// the user's own source keep external linkage — they are the unit's exports
-/// and survive whole-program DCE — and a unit with no top-level code gets no
-/// `main` (the Go compiler's objectMode rule). Prelude definitions stay
-/// internal in both modes: the prelude spells everything `public`, but it is
-/// each unit's private runtime, not an export surface.
+/// compilation, shared libraries), `public` functions and globals defined in
+/// the user's own source keep external linkage: they are the unit's exports
+/// and survive whole-program DCE. A unit with no top-level code gets no
+/// `main`. Prelude definitions stay internal in both modes; the prelude spells
+/// everything `public`, but it is each unit's private runtime, not an export
+/// surface.
 pub const Mode = enum { exe, library };
 
 /// Populates the module from the program. The module must verify afterwards.
@@ -59,8 +56,8 @@ pub fn run(arena: std.mem.Allocator, diags: *diag.Diagnostics, in: Input) Error!
         break :blk empty;
     };
     // A second builder dedicated to allocas, positioned into each function's
-    // entry block, so every alloca lands there (standard LLVM practice; also
-    // makes jumping over declarations with goto safe).
+    // entry block, so every alloca lands there. Also makes jumping over
+    // declarations with goto safe.
     const ab = c.LLVMCreateBuilderInContext(in.ctx);
     defer c.LLVMDisposeBuilder(ab);
 
@@ -89,8 +86,8 @@ pub fn run(arena: std.mem.Allocator, diags: *diag.Diagnostics, in: Input) Error!
 
 // ---- machine value types ----
 
-/// The machine type of a scalar value in flight (the Go ir.Ty). Aggregates
-/// have no VTy: they live in memory and are reached through a pointer.
+/// The machine type of a scalar value in flight. Aggregates have no VTy: they
+/// live in memory and are reached through a pointer.
 const VTy = enum {
     i8_,
     u8_,
@@ -137,7 +134,7 @@ const Lvalue = struct {
     ty: ast.Type,
 };
 
-// ---- shared AST type helpers (ports of the Go module-level helpers) ----
+// ---- shared AST type helpers ----
 
 const prim_i64: ast.Type = .{ .prim = .I64 };
 const prim_u8: ast.Type = .{ .prim = .U8 };
@@ -235,7 +232,7 @@ fn className(ty: ast.Type) ?[]const u8 {
     };
 }
 
-// ---- primitive intrinsics (port of goref ir/prim.go) ----
+// ---- primitive intrinsics ----
 
 const PrimKind = enum {
     std_write,
@@ -285,6 +282,21 @@ const PrimKind = enum {
     futex_wait,
     futex_wake,
     futex_wait_ns,
+    // Floating-point math intrinsics (llvm.*.f64).
+    msqrt,
+    mpow,
+    msin,
+    mcos,
+    mfloor,
+    mceil,
+    mtrunc,
+    mround,
+    mabs,
+    mexp,
+    mexp2,
+    mlog,
+    mlog2,
+    mlog10,
 };
 
 const prim_names = std.StaticStringMap(PrimKind).initComptime(.{
@@ -335,13 +347,27 @@ const prim_names = std.StaticStringMap(PrimKind).initComptime(.{
     .{ "FutexWait", .futex_wait },
     .{ "FutexWake", .futex_wake },
     .{ "FutexWaitNs", .futex_wait_ns },
+    .{ "Sqrt", .msqrt },
+    .{ "Pow", .mpow },
+    .{ "Sin", .msin },
+    .{ "Cos", .mcos },
+    .{ "Floor", .mfloor },
+    .{ "Ceil", .mceil },
+    .{ "Trunc", .mtrunc },
+    .{ "Round", .mround },
+    .{ "Abs", .mabs },
+    .{ "Exp", .mexp },
+    .{ "Exp2", .mexp2 },
+    .{ "Log", .mlog },
+    .{ "Log2", .mlog2 },
+    .{ "Log10", .mlog10 },
 });
 
 // ---- the lowerer ----
 
-/// A function's call-relevant signature (the Go fnSig): the declaration that
-/// carries parameters/defaults, whether any declaration has a body, and the
-/// LLVM function once created.
+/// A function's call-relevant signature: the declaration that carries
+/// parameters/defaults, whether any declaration has a body, and the LLVM
+/// function once created.
 const FnSig = struct {
     def: *const ast.FuncDef,
     has_body: bool = false,
@@ -484,8 +510,7 @@ const Lowerer = struct {
         }
     }
 
-    /// Whether argc/argv are referenced at top level (outside any function),
-    /// the Go Program.UsesCommandLine gate.
+    /// Whether argc/argv are referenced at top level (outside any function).
     fn usesCommandLine(l: *Lowerer) bool {
         for (l.prog.items) |s| {
             if (s.kind == .func_def) continue;
@@ -605,7 +630,7 @@ const Lowerer = struct {
     }
 
     /// Whether a defined function/global is part of the unit's export surface:
-    /// library mode, `public`, and defined in the user's own source (file 0 —
+    /// library mode, `public`, and defined in the user's own source (file 0;
     /// the prelude spells everything public but is each unit's private
     /// runtime).
     fn exportsName(l: *const Lowerer, is_public: bool, def_file: u32) bool {
@@ -717,7 +742,7 @@ const Lowerer = struct {
         return c.LLVMBuildGEP2(l.b, l.ty_i8, base, &idx, 1, "");
     }
 
-    /// base + index*stride, the Go PtrAdd.
+    /// base + index*stride.
     fn gepScaled(l: *Lowerer, base: *c.Value, index: *c.Value, stride: u64) *c.Value {
         var off = index;
         if (stride != 1) {
@@ -793,8 +818,8 @@ const Lowerer = struct {
 
     /// Synthesizes `i32 main(i32 argc, ptr argv, ptr envp)` from the
     /// top-level statements. main seeds the implicit globals and the Fs task
-    /// context, runs the top-level code, then (like the Go entry trampoline)
-    /// returns 0 regardless of the top-level value.
+    /// context, runs the top-level code, then returns 0 regardless of the
+    /// top-level value.
     fn lowerEntry(l: *Lowerer) Error!void {
         // Split the top level: standalone labelled asm blocks are module-level
         // code regardless of entry; everything else that is not a pure
@@ -816,9 +841,8 @@ const Lowerer = struct {
             try top.append(l.arena, s);
         }
 
-        // The Go objectMode rule: a separate-compilation unit with no
-        // top-level code gets no entry (a shared library of functions must
-        // not define main).
+        // A separate-compilation unit with no top-level code gets no entry (a
+        // shared library of functions must not define main).
         if (l.mode == .library and top.items.len == 0) return;
 
         var main_params = [_]*c.Type{ l.ty_i32, l.ty_ptr, l.ty_ptr };
@@ -934,8 +958,8 @@ const FnCtx = struct {
         return fc;
     }
 
-    /// Closes the function: the Go pairing diagnostic for inline asm, then
-    /// the default return on fall-off.
+    /// Closes the function: the pairing diagnostic for inline asm, then the
+    /// default return on fall-off.
     fn finish(fc: *FnCtx) Error!void {
         const l = fc.l;
         if (fc.asm_seen and !fc.asm_matched) {
@@ -1030,7 +1054,7 @@ const FnCtx = struct {
         return a;
     }
 
-    // ---- coercion (the Go coerce/Cast semantics) ----
+    // ---- coercion ----
 
     fn coerce(fc: *FnCtx, tv: TV, to: VTy) TV {
         const l = fc.l;
@@ -1075,7 +1099,7 @@ const FnCtx = struct {
             .f64_ => {
                 // Truncating float→int conversion; an unsigned 64-bit
                 // destination converts unsigned, narrower ones convert via
-                // signed I64 then truncate (the Go/x86 cvttsd2si shape).
+                // signed I64 then truncate (the x86 cvttsd2si shape).
                 iv = if (to == .u64_)
                     c.LLVMBuildFPToUI(b, tv.v, l.ty_i64, "")
                 else
@@ -1141,8 +1165,8 @@ const FnCtx = struct {
     }
 
     /// Restores Fs->exc_top to the state before the try region at
-    /// target_depth: the runtime part of the Go exitTryRegions, emitted for
-    /// each non-local exit (break/goto/return) that escapes try regions.
+    /// target_depth, emitted for each non-local exit (break/goto/return) that
+    /// escapes try regions.
     fn exitTryRegions(fc: *FnCtx, target_depth: usize, span: source.Span) Error!void {
         if (fc.tries.items.len <= target_depth) return;
         const l = fc.l;
@@ -1257,7 +1281,7 @@ const FnCtx = struct {
     /// one side-effecting inline-asm call: pinned variables sync through
     /// their registers ({reg} in, ={reg} out), variables named as operands
     /// pass their address as `r` inputs, and every other named GP register is
-    /// clobbered (plus memory and the flags — correctness over performance).
+    /// clobbered (plus memory and the flags; correctness over performance).
     fn lowerInlineAsm(fc: *FnCtx, a: *const ast.AsmStmt) Error!void {
         const l = fc.l;
         var g = AsmGen{ .l = l, .a = a, .info = asmArchInfo(l.tgt.arch), .fc = fc };
@@ -1395,7 +1419,7 @@ const FnCtx = struct {
         }
     }
 
-    /// Zero storage, then apply the initializer (the Go initMemory).
+    /// Zero storage, then apply the initializer.
     fn initMemory(fc: *FnCtx, base: *c.Value, ty: ast.Type, init: ?*ast.Expr) Error!void {
         const l = fc.l;
         const size = l.layouts.sizeOf(ty);
@@ -1466,8 +1490,8 @@ const FnCtx = struct {
         // chain, whose frames live on this function's dying stack.
         try fc.exitTryRegions(0, span);
         if (fc.is_entry) {
-            // The entry's return value is discarded (the Go trampoline
-            // returned 0 regardless); the expression still runs.
+            // The entry's return value is discarded (main always returns 0);
+            // the expression still runs.
             if (e) |expr| _ = try fc.lowerExpr(expr);
             try fc.emitAtexitRun();
             _ = c.LLVMBuildRet(l.b, l.constI32(0));
@@ -1803,8 +1827,7 @@ const FnCtx = struct {
         }
 
         // The landing pad: a throw longjmp'd here with the frame still on
-        // the chain; pop it before running the handler (the Go dispatcher's
-        // count-- before jumping to the pad).
+        // the chain; pop it before running the handler.
         fc.position(pad);
         try fc.popExcTop(prev_ptr, offs, span);
         try fc.pushScope();
@@ -1844,9 +1867,8 @@ const FnCtx = struct {
         const jmp = fc.newBlock("throw.unwind");
         fc.condBr(is_null, die, jmp);
 
-        // Uncaught: the Go runtime propagated the throw out of @entry and
-        // the trampoline returned 0, so an uncaught throw exits successfully
-        // and silently. Replicate that.
+        // An uncaught throw exits successfully and silently: it propagates
+        // out of @entry, which returns 0.
         fc.position(die);
         var exit_params = [_]*c.Type{l.ty_i32};
         const exit_fn = try l.libcFn("exit", l.ty_void, &exit_params, false);
@@ -1864,15 +1886,14 @@ const FnCtx = struct {
 
     // ---- expressions ----
 
-    /// e's machine type from its checked AST type (the Go exprTy).
+    /// e's machine type from its checked AST type.
     fn vtyOf(e: *const ast.Expr) VTy {
         const t = e.ty orelse return .i64_;
         return scalarVTy(t) orelse .i64_;
     }
 
-    /// Lowers e to an i1 condition (the Go lowerCond): a top-level
-    /// comparison compares at the promoted width with the operands'
-    /// signedness; anything else is `!= 0`.
+    /// Lowers e to an i1 condition: a top-level comparison compares at the
+    /// promoted width with the operands' signedness; anything else is `!= 0`.
     fn lowerCond(fc: *FnCtx, e: *ast.Expr) Error!*c.Value {
         switch (e.kind) {
             .binary => |k| {
@@ -2513,7 +2534,7 @@ const FnCtx = struct {
                 try call_args.append(l.arena, av);
             } else {
                 // Extra arguments beyond the declared parameters are passed
-                // by value class (the Go lowering did the same).
+                // by value class.
                 const v = try fc.lowerExpr(a);
                 const av = switch (v.ty) {
                     .f64_, .ptr_ => v,
@@ -2689,7 +2710,7 @@ const FnCtx = struct {
         return .{ .v = cv, .ty = scalarVTy(s.def.ret) orelse .i64_ };
     }
 
-    // ---- primitives (goref backend/arch runtime, on libc) ----
+    // ---- primitives (runtime built on libc) ----
 
     fn emitPrim(fc: *FnCtx, pk: PrimKind, args: []const ?*ast.Expr, span: source.Span) Error!TV {
         const l = fc.l;
@@ -2999,12 +3020,46 @@ const FnCtx = struct {
             .futex_wait, .futex_wake, .futex_wait_ns => {
                 return fc.emitFutex(pk, vals.items, span);
             },
+            // Floating-point math: each lowers to its LLVM intrinsic, which the
+            // optimizer turns into a hardware op (sqrt/floor/ceil/trunc/fabs),
+            // constant-folds, or reduces to a libm call where there is no
+            // hardware form.
+            .msqrt => return fc.emitFIntrinsic("llvm.sqrt.f64", 1, vals.items, span),
+            .mpow => return fc.emitFIntrinsic("llvm.pow.f64", 2, vals.items, span),
+            .msin => return fc.emitFIntrinsic("llvm.sin.f64", 1, vals.items, span),
+            .mcos => return fc.emitFIntrinsic("llvm.cos.f64", 1, vals.items, span),
+            .mfloor => return fc.emitFIntrinsic("llvm.floor.f64", 1, vals.items, span),
+            .mceil => return fc.emitFIntrinsic("llvm.ceil.f64", 1, vals.items, span),
+            .mtrunc => return fc.emitFIntrinsic("llvm.trunc.f64", 1, vals.items, span),
+            .mround => return fc.emitFIntrinsic("llvm.round.f64", 1, vals.items, span),
+            .mabs => return fc.emitFIntrinsic("llvm.fabs.f64", 1, vals.items, span),
+            .mexp => return fc.emitFIntrinsic("llvm.exp.f64", 1, vals.items, span),
+            .mexp2 => return fc.emitFIntrinsic("llvm.exp2.f64", 1, vals.items, span),
+            .mlog => return fc.emitFIntrinsic("llvm.log.f64", 1, vals.items, span),
+            .mlog2 => return fc.emitFIntrinsic("llvm.log2.f64", 1, vals.items, span),
+            .mlog10 => return fc.emitFIntrinsic("llvm.log10.f64", 1, vals.items, span),
         }
     }
 
-    /// r >= 0 ? r : -errno — HolyC's failure convention for filesystem
-    /// primitives (the Go @errno_fixup helper, minus the cross-OS errno
-    /// renumbering, which no golden observes).
+    /// Lowers an F64 math primitive to its named LLVM intrinsic (`llvm.sqrt.f64`
+    /// …): `arity` F64 arguments in, one F64 out. Declaring the overloaded
+    /// name is enough; LLVM resolves it to the real intrinsic.
+    fn emitFIntrinsic(fc: *FnCtx, name: []const u8, arity: usize, vals: []const TV, span: source.Span) Error!TV {
+        const l = fc.l;
+        if (vals.len < arity) return l.failAt(span, "{s} expects {d} argument(s)", .{ name, arity });
+        var params: [2]*c.Type = undefined;
+        var argv: [2]*c.Value = undefined;
+        for (0..arity) |i| {
+            params[i] = l.ty_f64;
+            argv[i] = fc.coerce(vals[i], .f64_).v;
+        }
+        const f = try l.libcFn(name, l.ty_f64, params[0..arity], false);
+        return .{ .v = l.callLib(f, argv[0..arity]), .ty = .f64_ };
+    }
+
+    /// r >= 0 ? r : -errno, HolyC's failure convention for filesystem
+    /// primitives. The cross-OS errno renumbering is omitted; no golden
+    /// observes it.
     fn errnoFix(fc: *FnCtx, r: *c.Value) Error!TV {
         const l = fc.l;
         const darwin = l.tgt.os == .darwin;
@@ -3147,20 +3202,18 @@ const FnCtx = struct {
 // ---- inline assembly ----
 //
 // HolyC asm blocks are lowered by rendering them back to assembler text and
-// handing that text to LLVM (the Zig/LLVM equivalent of the Go compiler's
-// per-arch assemblers in backend/arch/{amd64,arm64}):
+// handing that text to LLVM:
 //
 //   - A standalone labelled top-level block becomes module-level asm defining
 //     its labels as global symbols; `_extern LABEL sig;` call sites call the
 //     label as an ordinary external function.
 //   - A labelless block inside a function becomes one side-effecting inline
-//     asm call. A HolyC variable named as an operand (the Go frame-slot
-//     rewrite) is passed by address as an `r` input and referenced through a
-//     register-indirect memory operand; a `reg <REG>` pinned variable whose
-//     register the block names is synced through the block as a tied
-//     `{reg}` input / `={reg}` output pair (the Go allocator serviced the
-//     pinned slot from the register for the whole function; syncing at the
-//     block boundary preserves the observable variable/register contract).
+//     asm call. A HolyC variable named as an operand is passed by address as
+//     an `r` input and referenced through a register-indirect memory operand;
+//     a `reg <REG>` pinned variable whose register the block names is synced
+//     through the block as a tied `{reg}` input / `={reg}` output pair, which
+//     preserves the observable variable/register contract at the block
+//     boundary.
 //
 // amd64 text is rendered in Intel syntax (HolyC asm is `mnemonic dst, src`);
 // the other arches in their standard GAS syntax. HolyC always spells named
@@ -3178,7 +3231,7 @@ const AsmArchInfo = struct {
     /// Prefix rendered before an integer immediate ("#" on arm64).
     imm_prefix: []const u8,
     /// The always-clobbered tail of every inline-asm constraint string:
-    /// memory plus the arch's flags — correctness over performance.
+    /// memory plus the arch's flags; correctness over performance.
     baseline_clobbers: []const u8,
     /// Bracketing for standalone module-level asm blocks (module asm defaults
     /// to AT&T, so Intel-dialect text carries syntax directives).
@@ -3280,7 +3333,7 @@ fn asmWidthKeyword(width: u64) []const u8 {
 }
 
 /// The access width of a typed memory operand's spelling (`U64 SF_ARG1[RBP]`);
-/// null for an unknown spelling. The Go asmWidth mapping.
+/// null for an unknown spelling.
 fn asmTyWidth(ty: []const u8) ?u64 {
     const map = std.StaticStringMap(u64).initComptime(.{
         .{ "I8", 1 },  .{ "U8", 1 },
@@ -3323,7 +3376,7 @@ const AsmGen = struct {
     /// An inline block's intra-block label, spelled as an assembler-local
     /// symbol (`L`/`.L` prefix per object format). `${:uid}` expands to a
     /// per-asm-instance unique id, so the label cannot collide with another
-    /// block's — or with a duplicated copy of its own (LLVM may clone inline
+    /// block's, or with a duplicated copy of its own (LLVM may clone inline
     /// asm during optimization). The Intel-dialect parser rejects GAS numeric
     /// local labels (`1:`/`1b`), so named labels are used on both arches.
     fn putLocalLabel(g: *AsmGen, map_idx: usize) Error!void {
@@ -3436,8 +3489,7 @@ const AsmGen = struct {
                 try g.info.renderVarRef(g, opnum, g.vars.items[idx].width);
             },
             .sym => |name| {
-                // `&name`: a branch target, resolved within the block (the Go
-                // assemblers resolved fixups against the block's labels).
+                // `&name`: a branch target, resolved within the block.
                 const map_idx = g.labels.getIndex(name) orelse
                     return l.failAt(op.span, "asm branch to undefined label `{s}`", .{name});
                 if (g.fc == null) {
@@ -3539,7 +3591,7 @@ const AsmGen = struct {
 
     /// PPC assembler operands are bare register numbers (the LLVM parser
     /// rejects `r3`): the source's named register renders as its number.
-    /// Prefixless specials (lr/ctr/xer) pass through — they only appear via
+    /// Prefixless specials (lr/ctr/xer) pass through; they only appear via
     /// mnemonics, so the assembler rejects them as operands with a good error.
     fn renderRegPpc(g: *AsmGen, name: []const u8) Error!void {
         const digits = std.mem.indexOfAny(u8, name, "0123456789") orelse

@@ -1,4 +1,5 @@
 // dynamic allocation: MAlloc, use the block, then Free.
+#include <Mem.HC>
 I64 *p = MAlloc(4 * 8); // room for four I64s
 I64 i, sum = 0;
 for (i = 0; i < 4; i++)

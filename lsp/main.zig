@@ -27,6 +27,18 @@ pub fn main(init: std.process.Init) !void {
     );
     defer server.deinit();
 
+    // The angle-bracket #include search path (HCC_PATH/pkg, HCC_ROOT/std),
+    // resolved the same way hcc does, so the editor sees the standard library
+    // and third-party packages. Lives for the server's lifetime; best-effort
+    // (a path that cannot be resolved leaves std includes unresolved).
+    var include_arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
+    defer include_arena.deinit();
+    server.include_path = Server.computeIncludePath(include_arena.allocator(), io, init.environ_map) catch &.{};
+
+    // Where the embedded prelude is extracted so go-to-definition can jump into
+    // it (`<HCC_ROOT>/.cache/core`). gpa-owned; freed in server.deinit.
+    server.core_cache_dir = Server.coreCacheDir(std.heap.smp_allocator, io, init.environ_map);
+
     const code = try server.run();
     std.process.exit(code);
 }
@@ -37,6 +49,7 @@ test {
     _ = @import("framing.zig");
     _ = @import("uri.zig");
     _ = @import("position.zig");
+    _ = @import("nav.zig");
     _ = @import("Server.zig");
     _ = @import("server_test.zig");
 }

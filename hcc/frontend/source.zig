@@ -3,8 +3,7 @@
 
 const std = @import("std");
 
-/// A position in a source file. Both line and col are 1-based, matching what
-/// humans expect in error messages.
+/// A position in a source file. Line and col are 1-based, for error messages.
 pub const Pos = struct {
     line: u32 = 1,
     col: u32 = 1,

@@ -1,11 +1,15 @@
-// MAllocFree.HC — the task heap. MAlloc/Free/MSize/HeapExtend are compiler
-// intrinsics: the prototypes put them in scope for the type-checker, and the
-// compiler lowers each call directly to an IR op (PrimInst), so their prototype
-// bodies are never emitted. ReAlloc/CAlloc are ordinary HolyC built on top of them.
-// Part of the always-resident prelude (see Lib.HC).
-#ifndef __PRELUDE_MEM_MALLOCFREE_HC
-#define __PRELUDE_MEM_MALLOCFREE_HC
+// Mem.HC — the task heap plus raw byte-buffer utilities.
+// `#include <Mem.HC>`.
+//
+// MAlloc/Free/MSize/HeapExtend are compiler intrinsics (each call lowers
+// directly to an IR op, so their prototype bodies are never emitted);
+// CAlloc/ReAlloc are ordinary HolyC built on top of them. MemCpy/MemSet/MemCmp
+// operate on U8* buffers with an explicit length. A host service, not part of
+// the dialect core.
+#ifndef __STD_MEM_HC
+#define __STD_MEM_HC
 
+// ---- the task heap ----
 public U8 *MAlloc(I64 size);                        // allocate size bytes on the task heap; returns the block
 public U0  Free(U8 *ptr);                           // free a block returned by MAlloc
 public I64 MSize(U8 *ptr);                          // usable size of a block returned by MAlloc
@@ -45,4 +49,34 @@ public U8 *ReAlloc(U8 *p, I64 oldsz, I64 newsz)
   return q;
 }
 
-#endif // __PRELUDE_MEM_MALLOCFREE_HC
+// ---- raw byte-buffer utilities (pure HolyC; inline and dead-strip) ----
+
+// Copy n bytes from src to dst (no overlap handling); returns dst.
+public U8 *MemCpy(U8 *dst, U8 *src, I64 n)
+{
+  I64 i;
+  for (i = 0; i < n; i++)
+    dst[i] = src[i];
+  return dst;
+}
+
+// Set n bytes of dst to the low byte of c; returns dst.
+public U8 *MemSet(U8 *dst, I64 c, I64 n)
+{
+  I64 i;
+  for (i = 0; i < n; i++)
+    dst[i] = c;
+  return dst;
+}
+
+// Compare n bytes: <0, 0, or >0 by the first differing byte (like C memcmp).
+public I64 MemCmp(U8 *a, U8 *b, I64 n)
+{
+  I64 i;
+  for (i = 0; i < n; i++)
+    if (a[i] != b[i])
+      return a[i] - b[i];
+  return 0;
+}
+
+#endif // __STD_MEM_HC

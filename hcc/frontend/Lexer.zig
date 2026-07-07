@@ -6,9 +6,8 @@
 //! comments, where they pass through untouched.
 //!
 //! Identifiers are slices into the source buffer; string literals (which need
-//! escape resolution) are allocated from the arena given to `init`, which owns
-//! everything the front end produces. Errors are reported through the shared
-//! diagnostics list with stage `.lex`.
+//! escape resolution) are allocated from the front-end arena given to `init`.
+//! Errors are reported through the shared diagnostics list with stage `.lex`.
 
 const std = @import("std");
 const source = @import("source.zig");

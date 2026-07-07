@@ -40,6 +40,28 @@ pub const Error = diag.Error;
 /// A hard cap on #include nesting, a backstop beyond the cycle guard.
 const max_include_depth = 64;
 
+/// The outcome of running an #exe block: either the program's captured stdout
+/// (spliced back in as source) or a human-readable failure message.
+pub const ExeResult = union(enum) {
+    ok: []const u8,
+    err: []const u8,
+};
+
+/// Runs one #exe block's compile-time program and returns its stdout. The
+/// preprocessor lives in the frontend module, which links no backend, so the
+/// driver injects this: it sub-compiles `unit` (the file up to the directive
+/// plus the block body as top-level statements), runs the host executable, and
+/// captures stdout. `ctx` is the opaque driver state passed alongside the fn;
+/// `base_dir` fixes where the unit's relative #includes resolve. The returned
+/// bytes must outlive the splice, so they are allocated in `arena`.
+pub const ExeRunner = *const fn (
+    ctx: *anyopaque,
+    arena: std.mem.Allocator,
+    io: std.Io,
+    unit: []const u8,
+    base_dir: []const u8,
+) ExeResult;
+
 /// A compiler-predefined object-like macro: NAME expands to the integer value
 /// (or 1 when value is not a decimal integer). Used to seed platform macros.
 pub const Define = struct {
@@ -47,9 +69,14 @@ pub const Define = struct {
     value: []const u8,
 };
 
-/// One entry in the macro table. HolyC has only object-like macros, so a macro
-/// is just its replacement body.
+/// One entry in the macro table. An object-like macro has `params == null` and
+/// is its replacement body. A function-like macro (a C extension over
+/// TempleOS HolyC) carries a parameter list and is only expanded when its name
+/// is followed by `(`; `variadic` marks a trailing `...` whose extra arguments
+/// gather into `__VA_ARGS__`.
 const Macro = struct {
+    params: ?[]const []const u8 = null,
+    variadic: bool = false,
     body: []const Token,
 };
 
@@ -79,9 +106,10 @@ const PpTok = struct {
 const Frame = struct {
     /// Lexer streaming the included file's tokens.
     lexer: Lexer,
-    /// Token read past the #include line in the parent, re-queued on
-    /// exhaustion.
-    resume_tok: ?Token,
+    /// Tokens read past the directive that opened this frame (the single token
+    /// parked past an #include line, or the same-line leftovers after an #exe
+    /// block), replayed in order once the frame is exhausted.
+    resume_toks: []const Token,
     /// This file's directory, for its own relative #includes.
     dir: []const u8,
     /// Canonical path, for cycle detection ("fs:"-prefixed for embedded files).
@@ -121,12 +149,27 @@ inner: Lexer,
 /// A one-token push-back for the inner stream. A directive sometimes reads one
 /// token past its line and parks it here.
 lookahead: ?Token = null,
+/// Tokens to replay before anything else, nearest LAST (LIFO). A frame's
+/// resume tokens land here when it is exhausted, so they stream out ahead of
+/// the enclosing source; the parser never sees them out of order.
+pushback: std.ArrayList(Token) = .empty,
 /// Buffered, expanded tokens awaiting output. Stored as a stack with the
 /// nearest token LAST, so taking the front and prepending macro expansions are
 /// both O(1).
 pending: std.ArrayList(PpTok) = .empty,
 macros: std.StringArrayHashMapUnmanaged(Macro) = .empty,
 base_dir: []const u8,
+/// Ordered directories searched for angle-bracket #include <...> (library and
+/// package includes): the -I dirs followed by the package roots
+/// (HCC_PATH/pkg, HCC_ROOT/std). Each is tried in turn; first match wins.
+/// Empty means angle-bracket includes cannot resolve.
+include_path: []const []const u8 = &.{},
+/// Maps a dependency alias (from the project's hcc.toml) to a package path, so
+/// `#include <json/File.HC>` expands before resolution. A remote dependency
+/// maps to its import path (searched on include_path); a local (submodule)
+/// dependency maps to an absolute directory (resolved directly). Empty (no
+/// hcc.toml) leaves includes untouched.
+aliases: std.StringHashMapUnmanaged([]const u8) = .empty,
 includes: std.ArrayList(Frame) = .empty,
 /// The conditional-compilation nesting stack, innermost last. Empty means the
 /// top level, which always emits.
@@ -139,6 +182,18 @@ prelude_injected: bool = false,
 /// entry 0 is the base/top-level source. It never shrinks, so ids stay valid
 /// for the whole parse.
 files: std.ArrayList(source.FileInfo) = .empty,
+/// The driver-injected #exe executor, or null (the language server and tests
+/// leave it unset, so #exe reports it is unavailable rather than pulling the
+/// backend into the frontend module).
+exe_runner: ?ExeRunner = null,
+exe_ctx: *anyopaque = undefined,
+/// Counts spliced #exe outputs, so each generated frame gets a unique
+/// synthetic path for the cycle check.
+exe_gen: u32 = 0,
+/// A running hash of every source buffer consumed (base + prelude + every
+/// #include and #exe-spliced frame), for the driver's content-addressed build
+/// cache. Each buffer is length-prefixed so distinct file splits never collide.
+src_hasher: std.crypto.hash.sha2.Sha256 = std.crypto.hash.sha2.Sha256.init(.{}),
 
 pub const Options = struct {
     /// Directory that relative #include "..." paths in the top-level source
@@ -151,6 +206,17 @@ pub const Options = struct {
     /// Injects the implicit prelude ahead of the base source, so its
     /// definitions are in scope without an explicit #include.
     inject_prelude: bool = true,
+    /// Ordered search path for angle-bracket #include <...> (library/package
+    /// includes): each directory is tried in turn, first match wins. Plain
+    /// "..." includes ignore this and resolve relative to the including file.
+    include_path: []const []const u8 = &.{},
+    /// Alias → import-path map from the project's hcc.toml. See the field of
+    /// the same name; empty means no alias expansion.
+    aliases: std.StringHashMapUnmanaged([]const u8) = .empty,
+    /// The #exe compile-time executor and its opaque driver state. Null (the
+    /// default) makes #exe report that it is unavailable.
+    exe_runner: ?ExeRunner = null,
+    exe_ctx: *anyopaque = undefined,
 };
 
 pub fn init(
@@ -166,6 +232,10 @@ pub fn init(
         .io = io,
         .inner = Lexer.init(arena, diags, src),
         .base_dir = opts.base_dir,
+        .include_path = opts.include_path,
+        .aliases = opts.aliases,
+        .exe_runner = opts.exe_runner,
+        .exe_ctx = opts.exe_ctx,
     };
 
     // File 0, the base/top-level source. Its privacy comes from base_dir; the
@@ -174,6 +244,7 @@ pub fn init(
     // paths of #include'd files.
     const canon = canonicalizeExisting(io, arena, opts.base_dir) catch opts.base_dir;
     try p.files.append(arena, .{ .dir = try dirComponents(arena, canon), .name = "" });
+    p.hashSource(src); // the base source is the first input to the build digest
 
     try p.addDefines(&.{.{ .name = "__HCC__", .value = "1" }});
     if (opts.target) |tgt| try p.addDefines(targetMacros(tgt));
@@ -202,11 +273,12 @@ fn injectPrelude(p: *Preprocessor) Error!void {
     p.prelude_injected = true;
     const file_id: u32 = @intCast(p.files.items.len);
     try p.files.append(p.arena, try fileInfoForPath(p.arena, core.root));
+    p.hashSource(core.get(core.root).?);
     var lexer = Lexer.init(p.arena, p.diags, core.get(core.root).?);
     lexer.file = file_id;
     try p.includes.append(p.arena, .{
         .lexer = lexer,
-        .resume_tok = null,
+        .resume_toks = &.{},
         .dir = posixDirname(core.root),
         .path = try std.fmt.allocPrint(p.arena, "fs:{s}", .{core.root}),
         .embedded = true,
@@ -226,6 +298,24 @@ pub fn sourceFiles(p: *const Preprocessor) []const source.FileInfo {
     return p.files.items;
 }
 
+/// Folds one source buffer into the running content digest, length-prefixed so
+/// that a different split of the same bytes across files cannot collide.
+fn hashSource(p: *Preprocessor, bytes: []const u8) void {
+    var len: [8]u8 = undefined;
+    std.mem.writeInt(u64, &len, bytes.len, .little);
+    p.src_hasher.update(&len);
+    p.src_hasher.update(bytes);
+}
+
+/// The digest of every source buffer consumed so far. Call after parsing, when
+/// all #includes and #exe splices have been read. Keys the build cache.
+pub fn sourceDigest(p: *const Preprocessor) [32]u8 {
+    var copy = p.src_hasher;
+    var out: [32]u8 = undefined;
+    copy.final(&out);
+    return out;
+}
+
 fn fail(p: *Preprocessor, file: u32, pos: source.Pos, comptime fmt: []const u8, args: anytype) Error {
     return p.diags.fail(.preproc, file, pos, fmt, args);
 }
@@ -242,6 +332,7 @@ fn currentFile(p: *const Preprocessor) u32 {
 /// base source. Each frame stamps its file id onto the tokens it emits; the
 /// base source keeps file 0.
 fn innerNext(p: *Preprocessor) Error!Token {
+    if (p.pushback.items.len > 0) return p.pushback.pop().?;
     if (p.lookahead) |t| {
         p.lookahead = null;
         return t;
@@ -271,7 +362,13 @@ fn pull(p: *Preprocessor) Error!Token {
                 if (n > 0) {
                     try p.checkBalanced(n, t.span.file, t.span.pos);
                     const frame = p.includes.pop().?;
-                    p.lookahead = frame.resume_tok;
+                    // Replay the frame's resume tokens next, in order (they are
+                    // pushed reversed onto the LIFO pushback stack).
+                    var i = frame.resume_toks.len;
+                    while (i > 0) {
+                        i -= 1;
+                        try p.pushback.append(p.arena, frame.resume_toks[i]);
+                    }
                     continue;
                 }
                 try p.checkBalanced(0, t.span.file, t.span.pos);
@@ -323,12 +420,7 @@ fn directive(p: *Preprocessor, hash: Token) Error!void {
     if (std.mem.eql(u8, name, "define")) return p.doDefine(toks.items);
     if (std.mem.eql(u8, name, "undef")) return p.doUndef(toks.items);
     if (std.mem.eql(u8, name, "include")) return p.doInclude(toks.items);
-    if (std.mem.eql(u8, name, "exe")) {
-        // #exe (compile-time execution) is not supported. Report it explicitly
-        // rather than dropping it like an unknown directive, since its `{ … }`
-        // body would otherwise leak into the stream as ordinary code.
-        return p.fail(hash.span.file, hash.span.pos, "#exe (compile-time execution) is no longer supported", .{});
-    }
+    if (std.mem.eql(u8, name, "exe")) return p.doExe(toks.items, hash);
     // Unknown directive, e.g. #help_index: drop it.
 }
 
@@ -370,7 +462,7 @@ fn doConditional(p: *Preprocessor, name: []const u8, toks: []const Token, file: 
 
 /// Opens a new conditional group for #if/#ifdef/#ifndef. The controlling
 /// expression is evaluated only when the enclosing region is live; inside an
-/// already skipped region the directive just balances nesting and never errors
+/// already skipped region the directive only balances nesting and never errors
 /// on its operand.
 fn pushCond(p: *Preprocessor, name: []const u8, toks: []const Token, file: u32, pos: source.Pos) Error!void {
     const parent_active = p.emitting();
@@ -502,33 +594,14 @@ fn definedOperand(p: *Preprocessor, toks: []const Token, i: usize, file: u32, po
     }
 }
 
-/// Fully object-like-macro-expands a standalone token slice, mirroring the
-/// main expander (nextExpanded) but over a private queue rather than the
-/// output stream. Used for #if/#elif expressions; surviving identifiers are
-/// left for the evaluator to read as 0.
+/// Fully macro-expands a standalone token slice (object-like and function-like)
+/// for #if/#elif expressions, reusing the argument expander. Surviving
+/// identifiers are left for the evaluator to read as 0.
 fn expandSlice(p: *Preprocessor, toks: []const Token) Error![]const Token {
-    // A stack with the nearest token last.
-    var queue: std.ArrayList(PpTok) = .empty;
-    try queue.ensureTotalCapacity(p.arena, toks.len);
-    var i = toks.len;
-    while (i > 0) {
-        i -= 1;
-        queue.appendAssumeCapacity(.{ .tok = toks[i] });
-    }
-    var out: std.ArrayList(Token) = .empty;
-    while (queue.pop()) |pt| {
-        if (pt.tok.kind == .ident) {
-            const name = pt.tok.kind.ident;
-            if (!HideSet.contains(pt.hide, name)) {
-                if (p.macros.get(name)) |m| {
-                    try p.prependWithHide(&queue, m.body, name, pt.hide);
-                    continue;
-                }
-            }
-        }
-        try out.append(p.arena, pt.tok);
-    }
-    return out.items;
+    const pps = try p.expandArg(try p.toPp(toks, null));
+    const out = try p.arena.alloc(Token, pps.len);
+    for (pps, 0..) |pt, i| out[i] = pt.tok;
+    return out;
 }
 
 /// A recursive-descent evaluator for a preprocessor #if integer constant
@@ -707,9 +780,45 @@ fn doDefine(p: *Preprocessor, toks: []const Token) Error!void {
         .ident => |s| s,
         else => return p.fail(toks[1].span.file, toks[1].span.pos, "macro name must be an identifier", .{}),
     };
-    // HolyC has only object-like #define (no function-like macros), so
-    // everything after the name is the replacement body. `#define F(x) x+1`
-    // defines F as the token sequence `(x) x+1`.
+    // Function-like macro iff a `(` directly abuts the name with no whitespace
+    // (the C rule that distinguishes `#define F(x) …` from `#define F (x) …`).
+    // Adjacency is read from the spans: same file, `(` starting where the name
+    // ended.
+    if (toks.len >= 3 and toks[2].kind == .l_paren and
+        toks[2].span.file == toks[1].span.file and toks[2].span.start == toks[1].span.end)
+    {
+        var params: std.ArrayList([]const u8) = .empty;
+        var variadic = false;
+        var i: usize = 3;
+        if (i < toks.len and toks[i].kind == .r_paren) {
+            i += 1; // empty parameter list: F()
+        } else {
+            while (true) {
+                if (i >= toks.len) return p.fail(toks[0].span.file, toks[0].span.pos, "unterminated macro parameter list", .{});
+                switch (toks[i].kind) {
+                    .ident => |pn| try params.append(p.arena, pn),
+                    .dot_dot_dot => variadic = true,
+                    else => return p.fail(toks[i].span.file, toks[i].span.pos, "macro parameter must be an identifier", .{}),
+                }
+                i += 1;
+                if (i >= toks.len) return p.fail(toks[0].span.file, toks[0].span.pos, "unterminated macro parameter list", .{});
+                if (toks[i].kind == .r_paren) {
+                    i += 1;
+                    break;
+                }
+                if (variadic) return p.fail(toks[i].span.file, toks[i].span.pos, "`...` must be the last macro parameter", .{});
+                if (toks[i].kind != .comma) return p.fail(toks[i].span.file, toks[i].span.pos, "expected `,` or `)` in macro parameters", .{});
+                i += 1;
+            }
+        }
+        try p.macros.put(p.arena, name, .{
+            .params = params.items,
+            .variadic = variadic,
+            .body = try p.arena.dupe(Token, toks[i..]),
+        });
+        return;
+    }
+    // Object-like: everything after the name is the replacement body.
     try p.macros.put(p.arena, name, .{ .body = try p.arena.dupe(Token, toks[2..]) });
 }
 
@@ -728,8 +837,13 @@ fn doUndef(p: *Preprocessor, toks: []const Token) Error!void {
 fn doInclude(p: *Preprocessor, toks: []const Token) Error!void {
     const file = toks[0].span.file;
     const pos = toks[0].span.pos;
+    // Angle-bracket form #include <path>: a library/package include resolved
+    // against the include path, never relative to the including file.
+    if (toks.len >= 2 and toks[1].kind == .lt) {
+        return p.doIncludeAngle(toks, file, pos);
+    }
     if (toks.len < 2 or toks[1].kind != .str) {
-        return p.fail(file, pos, "#include expects a \"path\"", .{});
+        return p.fail(file, pos, "#include expects a \"path\" or <path>", .{});
     }
     const path_str = toks[1].kind.str;
     var cur_dir = p.base_dir;
@@ -765,6 +879,169 @@ fn doInclude(p: *Preprocessor, toks: []const Token) Error!void {
         else => return p.fail(file, pos, "cannot open #include \"{s}\": {s}", .{ path_str, @errorName(e) }),
     };
     return p.openInclude(canon, path_str, file, pos, try fileInfoForDisk(p.arena, canon));
+}
+
+/// Resolves an angle-bracket #include <path> against the include path. The
+/// lexer has no directive context, so <path> arrives as `lt … gt` operator
+/// tokens rather than a string; the path is recovered from the raw source
+/// between the brackets (whitespace-insensitive, exact). Each include-path
+/// directory is tried in order; the first that resolves wins. Unlike "...",
+/// this never searches relative to the including file — library and package
+/// names live only on the include path.
+fn doIncludeAngle(p: *Preprocessor, toks: []const Token, file: u32, pos: source.Pos) Error!void {
+    var gt_idx: ?usize = null;
+    for (toks[2..], 2..) |t, i| {
+        if (t.kind == .gt) {
+            gt_idx = i;
+            break;
+        }
+    }
+    const gt = gt_idx orelse
+        return p.fail(file, pos, "unterminated #include <...>: missing '>'", .{});
+    // The header name is the raw text between '<' and '>' in the file the
+    // directive is in. All directive-line tokens share that file, so the
+    // innermost frame's (or base) source is the right buffer to slice.
+    const src = p.currentSource();
+    const name = std.mem.trim(u8, src[toks[1].span.end..toks[gt].span.start], " \t");
+    if (name.len == 0) return p.fail(file, pos, "#include <> has an empty path", .{});
+    // A dependency alias (from hcc.toml) expands to its full import path before
+    // resolution; a bare `<Str.HC>` has no leading segment to match and falls
+    // through to the stdlib path unchanged.
+    const resolved = try p.expandAlias(name);
+    // A prelude file is implicit and always in scope, angle brackets or not.
+    if (p.reservedPrelude(resolved)) |pn| return p.reservedPreludeErr(pn, file, pos);
+    // A local (submodule) alias expands to an absolute directory, so it resolves
+    // straight to a file rather than being searched on the pkg/std path.
+    if (std.fs.path.isAbsolute(resolved)) {
+        if (canonicalizeExisting(p.io, p.arena, resolved)) |canon| {
+            return p.openInclude(canon, name, file, pos, try fileInfoForDisk(p.arena, canon));
+        } else |e| if (e == error.OutOfMemory) return error.OutOfMemory;
+        return p.fail(file, pos, "cannot find #include <{s}> (local dependency {s})", .{ name, resolved });
+    }
+    for (p.include_path) |root| {
+        const joined = try std.fs.path.join(p.arena, &.{ root, resolved });
+        if (canonicalizeExisting(p.io, p.arena, joined)) |canon| {
+            return p.openInclude(canon, name, file, pos, try fileInfoForDisk(p.arena, canon));
+        } else |e| if (e == error.OutOfMemory) return error.OutOfMemory;
+    }
+    return p.fail(file, pos, "cannot find #include <{s}> on the include path", .{name});
+}
+
+/// Expands a leading dependency alias in an angle-include path to its full
+/// import path: `json/Json.HC` → `github.com/terry/json/Json.HC` when hcc.toml
+/// maps `json`. Only the first path segment is matched; a single-segment name
+/// (no `/`) or an unknown segment is returned unchanged, so stdlib and
+/// full-path includes are unaffected.
+fn expandAlias(p: *Preprocessor, name: []const u8) Error![]const u8 {
+    if (p.aliases.count() == 0) return name;
+    const slash = std.mem.indexOfScalar(u8, name, '/') orelse return name;
+    const full = p.aliases.get(name[0..slash]) orelse return name;
+    return std.fmt.allocPrint(p.arena, "{s}{s}", .{ full, name[slash..] });
+}
+
+/// The source buffer of the file currently being read (the innermost include
+/// frame, or the base source at the top level). Recovers raw text the token
+/// stream doesn't preserve, e.g. an angle-bracket header name.
+fn currentSource(p: *Preprocessor) []const u8 {
+    const n = p.includes.items.len;
+    if (n > 0) return p.includes.items[n - 1].lexer.src;
+    return p.inner.src;
+}
+
+/// Handles an #exe compile-time block: `#exe { …HolyC… }`. The block is
+/// compiled and run at compile time (via the driver-injected executor); its
+/// stdout is spliced back in as source exactly where the directive stood, so it
+/// can generate declarations or tables. The block sees the current file's
+/// preceding text (its own functions and types are in scope) and the implicit
+/// prelude; its body runs as top-level statements.
+///
+/// The lexer has no directive context, so the body arrives as ordinary tokens.
+/// The block is delimited by matching braces, and the raw body text is
+/// recovered from the source between the opening '{' and its matching '}'.
+fn doExe(p: *Preprocessor, toks: []const Token, hash: Token) Error!void {
+    const file = toks[0].span.file;
+    const pos = toks[0].span.pos;
+
+    // Scan for the opening '{' and its matching '}'. Tokens come from the
+    // collected directive-line tokens first (index 1 skips the "exe" name),
+    // then the live stream, which may span many lines.
+    var ti: usize = 1;
+    const open = try p.nextExeTok(toks, &ti);
+    if (open.kind != .l_brace)
+        return p.fail(open.span.file, open.span.pos, "#exe expects a '{{' to open its block", .{});
+    var depth: usize = 1;
+    var close: Token = undefined;
+    while (true) {
+        const t = try p.nextExeTok(toks, &ti);
+        switch (t.kind) {
+            .l_brace => depth += 1,
+            .r_brace => {
+                depth -= 1;
+                if (depth == 0) {
+                    close = t;
+                    break;
+                }
+            },
+            .eof => return p.fail(file, pos, "unterminated #exe block: missing '}}'", .{}),
+            else => {},
+        }
+    }
+
+    // The body and the file text preceding the directive both live in the
+    // buffer currently being read. All the scanned tokens share it, so the
+    // brace spans index into it directly.
+    const src = p.currentSource();
+    const body = src[open.span.end..close.span.start];
+    const prefix = src[0..hash.span.start];
+    const leftover = toks[ti..]; // any same-line tokens after '}'
+
+    // With no executor (the language server and tests supply none, so the
+    // backend stays out of the frontend module), the block cannot run: skip it
+    // silently rather than erroring, so an #exe file still analyzes in the
+    // editor. Any same-line tokens after '}' still resume in order.
+    const runner = p.exe_runner orelse {
+        var i = leftover.len;
+        while (i > 0) {
+            i -= 1;
+            try p.pushback.append(p.arena, leftover[i]);
+        }
+        return;
+    };
+
+    // The compile-time unit: the file up to the directive (so the block can
+    // call functions and reference types declared earlier), then the body as
+    // top-level statements. Its stdout becomes the spliced source.
+    const unit = try std.fmt.allocPrint(p.arena, "{s}\n{s}\n", .{ prefix, body });
+
+    // A generated frame inherits the current file's include base and privacy.
+    var dir_for_includes = p.base_dir;
+    var embedded = false;
+    if (p.includes.items.len > 0) {
+        const top = p.includes.items[p.includes.items.len - 1];
+        dir_for_includes = top.dir;
+        embedded = top.embedded;
+    }
+
+    switch (runner(p.exe_ctx, p.arena, p.io, unit, p.base_dir)) {
+        .err => |msg| return p.fail(file, pos, "#exe block failed: {s}", .{msg}),
+        .ok => |out_text| {
+            p.exe_gen += 1;
+            const gen_path = try std.fmt.allocPrint(p.arena, "exe:{d}", .{p.exe_gen});
+            const info = source.FileInfo{ .dir = p.files.items[file].dir, .name = "<exe>" };
+            try p.pushFrame(gen_path, dir_for_includes, out_text, "<exe>", file, pos, info, embedded, leftover);
+        },
+    }
+}
+
+/// The next token of an #exe block scan: the collected directive-line tokens
+/// (toks[ti..]) first, then the live inner stream.
+fn nextExeTok(p: *Preprocessor, toks: []const Token, ti: *usize) Error!Token {
+    if (ti.* < toks.len) {
+        const t = toks[ti.*];
+        ti.* += 1;
+        return t;
+    }
+    return p.innerNext();
 }
 
 /// Resolves a "::"-prefixed include (TempleOS upward search): tries suffix in
@@ -821,7 +1098,7 @@ fn openInclude(p: *Preprocessor, canon: []const u8, display: []const u8, file: u
         else => return p.fail(file, pos, "cannot read #include \"{s}\": {s}", .{ display, @errorName(e) }),
     };
     const dir = std.fs.path.dirname(canon) orelse ".";
-    return p.pushFrame(canon, dir, contents, display, file, pos, info, false);
+    return p.pushFrame(canon, dir, contents, display, file, pos, info, false, &.{});
 }
 
 /// Reads an include resolved within the embedded prelude table and pushes it
@@ -831,13 +1108,16 @@ fn openIncludeEmbedded(p: *Preprocessor, fs_path: []const u8, display: []const u
     const contents = core.get(fs_path) orelse
         return p.fail(file, pos, "cannot read #include \"{s}\": FileNotFound", .{display});
     const key = try std.fmt.allocPrint(p.arena, "fs:{s}", .{fs_path});
-    return p.pushFrame(key, posixDirname(fs_path), contents, display, file, pos, try fileInfoForPath(p.arena, fs_path), true);
+    return p.pushFrame(key, posixDirname(fs_path), contents, display, file, pos, try fileInfoForPath(p.arena, fs_path), true, &.{});
 }
 
-/// Pushes an include source onto the source stack, after the cycle and depth
-/// checks. path identifies the frame for the cycle check; dir is the base for
-/// that file's relative includes.
-fn pushFrame(p: *Preprocessor, path: []const u8, dir: []const u8, contents: []const u8, display: []const u8, file: u32, pos: source.Pos, info: source.FileInfo, embedded: bool) Error!void {
+/// Pushes an include (or #exe-generated) source onto the source stack, after
+/// the cycle and depth checks. path identifies the frame for the cycle check;
+/// dir is the base for that file's relative includes. extra_resume tokens (the
+/// same-line leftovers after an #exe block; empty for a plain #include) replay
+/// first when the frame is exhausted, ahead of the token parked past the
+/// directive line.
+fn pushFrame(p: *Preprocessor, path: []const u8, dir: []const u8, contents: []const u8, display: []const u8, file: u32, pos: source.Pos, info: source.FileInfo, embedded: bool, extra_resume: []const Token) Error!void {
     for (p.includes.items) |f| {
         if (std.mem.eql(u8, f.path, path)) {
             return p.fail(file, pos, "recursive #include of \"{s}\"", .{display});
@@ -846,10 +1126,14 @@ fn pushFrame(p: *Preprocessor, path: []const u8, dir: []const u8, contents: []co
     if (p.includes.items.len >= max_include_depth) {
         return p.fail(file, pos, "#include nested too deeply", .{});
     }
-    // The token already read past the #include line resumes the parent once
-    // the included file is exhausted.
-    const resume_tok = p.lookahead;
+    // Resume tokens replayed once the frame is exhausted: the extra_resume
+    // leftovers first, then the single token already read past the directive
+    // line.
+    var resume_list: std.ArrayList(Token) = .empty;
+    try resume_list.appendSlice(p.arena, extra_resume);
+    if (p.lookahead) |t| try resume_list.append(p.arena, t);
     p.lookahead = null;
+    p.hashSource(contents); // every included / #exe-spliced buffer feeds the digest
     // Register this file; its id is stamped onto the frame's tokens and the
     // table never shrinks, so ids stay valid for the whole parse.
     const file_id: u32 = @intCast(p.files.items.len);
@@ -858,7 +1142,7 @@ fn pushFrame(p: *Preprocessor, path: []const u8, dir: []const u8, contents: []co
     lexer.file = file_id;
     try p.includes.append(p.arena, .{
         .lexer = lexer,
-        .resume_tok = resume_tok,
+        .resume_toks = resume_list.items,
         .dir = dir,
         .path = path,
         .embedded = embedded,
@@ -880,7 +1164,9 @@ fn take(p: *Preprocessor) Error!PpTok {
     return p.pending.pop().?;
 }
 
-/// The fully-expanded next token.
+/// The fully-expanded next token. Object-like macros prepend their body for
+/// rescan; a function-like macro expands only when its name is immediately
+/// followed by `(`, otherwise the name is left as an ordinary identifier.
 fn nextExpanded(p: *Preprocessor) Error!Token {
     while (true) {
         const pt = try p.take();
@@ -888,8 +1174,22 @@ fn nextExpanded(p: *Preprocessor) Error!Token {
             const name = pt.tok.kind.ident;
             if (!HideSet.contains(pt.hide, name)) {
                 if (p.macros.get(name)) |m| {
-                    try p.prependWithHide(&p.pending, m.body, name, pt.hide);
-                    continue;
+                    if (m.params == null) {
+                        try p.pushExpansion(&p.pending, try p.toPp(m.body, pt.hide), name);
+                        continue;
+                    }
+                    // Function-like: peek for the `(` that makes it a call.
+                    const nxt = try p.take();
+                    if (nxt.tok.kind == .l_paren) {
+                        const raw = try p.collectArgsStream();
+                        const args = try p.checkArgs(m, raw, pt.tok);
+                        const exp = try p.substitute(m, args, pt.hide);
+                        try p.pushExpansion(&p.pending, exp, name);
+                        continue;
+                    }
+                    // Not a call: put the peeked token back and emit the name.
+                    try p.pending.append(p.arena, nxt);
+                    return pt.tok;
                 }
             }
         }
@@ -897,18 +1197,313 @@ fn nextExpanded(p: *Preprocessor) Error!Token {
     }
 }
 
-/// Pushes replacement tokens to the front of a pending stack (nearest last),
-/// each carrying base_hide plus mac so mac is not re-expanded within its own
-/// expansion.
-fn prependWithHide(p: *Preprocessor, queue: *std.ArrayList(PpTok), body: []const Token, mac: []const u8, base_hide: ?*const HideSet) Error!void {
-    const node = try p.arena.create(HideSet);
-    node.* = .{ .name = mac, .parent = base_hide };
-    try queue.ensureUnusedCapacity(p.arena, body.len);
-    var i = body.len;
+/// Wraps plain body tokens as PpToks carrying a base hide set (for object-like
+/// bodies, whose tokens have no per-token hide of their own).
+fn toPp(p: *Preprocessor, body: []const Token, hide: ?*const HideSet) Error![]const PpTok {
+    const out = try p.arena.alloc(PpTok, body.len);
+    for (body, 0..) |t, i| out[i] = .{ .tok = t, .hide = hide };
+    return out;
+}
+
+/// Pushes an expansion onto the front of a queue (nearest LAST), adding `mac`
+/// to each token's hide set so `mac` is not re-expanded within its own
+/// expansion. Each token keeps whatever hide it already carried (e.g. from
+/// argument pre-expansion), so nested expansions stay correctly guarded.
+fn pushExpansion(p: *Preprocessor, queue: *std.ArrayList(PpTok), exp: []const PpTok, mac: []const u8) Error!void {
+    try queue.ensureUnusedCapacity(p.arena, exp.len);
+    var i = exp.len;
     while (i > 0) {
         i -= 1;
-        queue.appendAssumeCapacity(.{ .tok = body[i], .hide = node });
+        const node = try p.arena.create(HideSet);
+        node.* = .{ .name = mac, .parent = exp[i].hide };
+        queue.appendAssumeCapacity(.{ .tok = exp[i].tok, .hide = node });
     }
+}
+
+/// Whether tok is a parameter of m, returning its index.
+fn paramIndex(m: Macro, tok: Token) ?usize {
+    const ps = m.params orelse return null;
+    if (tok.kind != .ident) return null;
+    for (ps, 0..) |pn, i| {
+        if (std.mem.eql(u8, pn, tok.kind.ident)) return i;
+    }
+    return null;
+}
+
+/// Whether tok is `__VA_ARGS__` in a variadic macro.
+fn isVaArgs(m: Macro, tok: Token) bool {
+    return m.variadic and tok.kind == .ident and std.mem.eql(u8, tok.kind.ident, "__VA_ARGS__");
+}
+
+/// Whether body[i], body[i+1] form the `##` paste operator: two `#` tokens with
+/// no space between them (so a stray `# #` is not mistaken for a paste).
+fn isPasteOp(body: []const Token, i: usize) bool {
+    return i + 1 < body.len and body[i].kind == .hash and body[i + 1].kind == .hash and
+        body[i].span.file == body[i + 1].span.file and body[i].span.end == body[i + 1].span.start;
+}
+
+/// Collects a function-like macro's arguments from the main token stream, the
+/// opening `(` already consumed, up to the matching `)`. Arguments are split on
+/// top-level commas; commas inside nested parentheses stay within an argument.
+fn collectArgsStream(p: *Preprocessor) Error![]const []const PpTok {
+    var args: std.ArrayList([]const PpTok) = .empty;
+    var cur: std.ArrayList(PpTok) = .empty;
+    var depth: usize = 0;
+    var comma_seen = false;
+    while (true) {
+        const pt = try p.take();
+        switch (pt.tok.kind) {
+            .eof => return p.fail(pt.tok.span.file, pt.tok.span.pos, "unterminated macro argument list", .{}),
+            .r_paren => {
+                if (depth == 0) break;
+                depth -= 1;
+                try cur.append(p.arena, pt);
+            },
+            .l_paren => {
+                depth += 1;
+                try cur.append(p.arena, pt);
+            },
+            .comma => {
+                if (depth == 0) {
+                    try args.append(p.arena, cur.items);
+                    cur = .empty;
+                    comma_seen = true;
+                } else try cur.append(p.arena, pt);
+            },
+            else => try cur.append(p.arena, pt),
+        }
+    }
+    if (!comma_seen and cur.items.len == 0) return &.{}; // `()`
+    try args.append(p.arena, cur.items);
+    return args.items;
+}
+
+/// Like collectArgsStream but reading from a local work stack (used while
+/// pre-expanding an argument), the opening `(` already popped.
+fn collectArgsStack(p: *Preprocessor, work: *std.ArrayList(PpTok)) Error![]const []const PpTok {
+    var args: std.ArrayList([]const PpTok) = .empty;
+    var cur: std.ArrayList(PpTok) = .empty;
+    var depth: usize = 0;
+    var comma_seen = false;
+    while (true) {
+        if (work.items.len == 0) return p.fail(0, .{}, "unterminated macro argument list", .{});
+        const pt = work.pop().?;
+        switch (pt.tok.kind) {
+            .r_paren => {
+                if (depth == 0) break;
+                depth -= 1;
+                try cur.append(p.arena, pt);
+            },
+            .l_paren => {
+                depth += 1;
+                try cur.append(p.arena, pt);
+            },
+            .comma => {
+                if (depth == 0) {
+                    try args.append(p.arena, cur.items);
+                    cur = .empty;
+                    comma_seen = true;
+                } else try cur.append(p.arena, pt);
+            },
+            else => try cur.append(p.arena, pt),
+        }
+    }
+    if (!comma_seen and cur.items.len == 0) return &.{};
+    try args.append(p.arena, cur.items);
+    return args.items;
+}
+
+/// Validates argument arity and normalizes the `F()` case (a single empty
+/// argument when one is expected). Returns the possibly-adjusted arg list.
+fn checkArgs(p: *Preprocessor, m: Macro, args: []const []const PpTok, name_tok: Token) Error![]const []const PpTok {
+    const named = m.params.?.len;
+    var a = args;
+    if (a.len == 0 and named >= 1) {
+        const one = try p.arena.alloc([]const PpTok, 1);
+        one[0] = &.{};
+        a = one;
+    }
+    const nm = name_tok.kind.ident;
+    if (m.variadic) {
+        if (a.len < named) return p.fail(name_tok.span.file, name_tok.span.pos, "macro `{s}` expects at least {d} argument(s), got {d}", .{ nm, named, a.len });
+    } else if (a.len != named) {
+        return p.fail(name_tok.span.file, name_tok.span.pos, "macro `{s}` expects {d} argument(s), got {d}", .{ nm, named, a.len });
+    }
+    return a;
+}
+
+/// The variadic arguments (those past the named parameters) rejoined with the
+/// commas that separated them, for `__VA_ARGS__`.
+fn vaRaw(p: *Preprocessor, m: Macro, args: []const []const PpTok) Error![]const PpTok {
+    var out: std.ArrayList(PpTok) = .empty;
+    var idx = m.params.?.len;
+    var first = true;
+    while (idx < args.len) : (idx += 1) {
+        if (!first) try out.append(p.arena, .{ .tok = .{ .kind = .comma } });
+        first = false;
+        try out.appendSlice(p.arena, args[idx]);
+    }
+    return out.items;
+}
+
+/// Fully expands a token sequence in isolation, used to pre-expand a macro
+/// argument before it is substituted into positions not adjacent to `#`/`##`
+/// (the C rule that makes nested calls and the STR/XSTR idiom work). A
+/// function-like macro whose `(` lies outside the sequence is left unexpanded.
+fn expandArg(p: *Preprocessor, input: []const PpTok) Error![]const PpTok {
+    var out: std.ArrayList(PpTok) = .empty;
+    var work: std.ArrayList(PpTok) = .empty;
+    var i = input.len;
+    while (i > 0) {
+        i -= 1;
+        try work.append(p.arena, input[i]);
+    }
+    while (work.items.len > 0) {
+        const pt = work.pop().?;
+        if (pt.tok.kind == .ident and !HideSet.contains(pt.hide, pt.tok.kind.ident)) {
+            const name = pt.tok.kind.ident;
+            if (p.macros.get(name)) |m| {
+                if (m.params == null) {
+                    try p.pushExpansion(&work, try p.toPp(m.body, pt.hide), name);
+                    continue;
+                }
+                if (work.items.len > 0 and work.items[work.items.len - 1].tok.kind == .l_paren) {
+                    _ = work.pop();
+                    const raw = try p.collectArgsStack(&work);
+                    const args = try p.checkArgs(m, raw, pt.tok);
+                    const exp = try p.substitute(m, args, pt.hide);
+                    try p.pushExpansion(&work, exp, name);
+                    continue;
+                }
+            }
+        }
+        try out.append(p.arena, pt);
+    }
+    return out.items;
+}
+
+/// A stringized form of an argument: the tokens' spellings joined by single
+/// spaces. Stored as the (already-decoded) value of a string token.
+fn stringize(p: *Preprocessor, arg: []const PpTok) Error![]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    for (arg, 0..) |a, idx| {
+        if (idx > 0) try buf.append(p.arena, ' ');
+        try buf.appendSlice(p.arena, try p.spell(a.tok));
+    }
+    return buf.items;
+}
+
+/// The source spelling of a token, for `#` stringize and `##` paste.
+fn spell(p: *Preprocessor, t: Token) Error![]const u8 {
+    return switch (t.kind) {
+        .ident => |s| s,
+        .keyword => |k| k.spelling(),
+        .int => |v| try std.fmt.allocPrint(p.arena, "{d}", .{v}),
+        .float => |v| try std.fmt.allocPrint(p.arena, "{d}", .{v}),
+        .str => |s| try std.fmt.allocPrint(p.arena, "\"{s}\"", .{s}),
+        .char => |v| try std.fmt.allocPrint(p.arena, "'{d}'", .{v}),
+        else => token_mod.Token.Kind.describe(t.kind),
+    };
+}
+
+/// Pastes two tokens by concatenating their spellings and re-lexing; null if
+/// that yields nothing.
+fn paste(p: *Preprocessor, a: Token, b: Token) Error!?Token {
+    const text = try std.fmt.allocPrint(p.arena, "{s}{s}", .{ try p.spell(a), try p.spell(b) });
+    if (text.len == 0) return null;
+    var lx = Lexer.init(p.arena, p.diags, text);
+    const first = lx.next() catch return null;
+    if (first.kind == .eof) return null;
+    return first;
+}
+
+/// Produces a function-like macro's expansion for a call, given the collected
+/// (raw) arguments. Parameters in ordinary positions are pre-expanded;
+/// parameters that are operands of `#` or `##` use their raw form. `base_hide`
+/// is the hide set of the invoking name, applied to body-origin tokens.
+fn substitute(p: *Preprocessor, m: Macro, args: []const []const PpTok, base_hide: ?*const HideSet) Error![]const PpTok {
+    var out: std.ArrayList(PpTok) = .empty;
+    const body = m.body;
+    var i: usize = 0;
+    while (i < body.len) {
+        // `##` token paste: operands are the last emitted token and the token
+        // (or raw argument) after the operator.
+        if (isPasteOp(body, i)) {
+            const ri = i + 2;
+            // GNU comma elision: `, ## __VA_ARGS__` drops the comma when the
+            // variadic arguments are empty, and otherwise just appends them.
+            if (ri < body.len and isVaArgs(m, body[ri])) {
+                const va = try p.vaRaw(m, args);
+                if (va.len == 0) {
+                    if (out.items.len > 0 and out.items[out.items.len - 1].tok.kind == .comma) _ = out.pop();
+                } else {
+                    for (va) |a| try out.append(p.arena, .{ .tok = a.tok, .hide = base_hide });
+                }
+                i = ri + 1;
+                continue;
+            }
+            const left: ?Token = if (out.items.len > 0) out.pop().?.tok else null;
+            var right: ?Token = null;
+            var rest: []const PpTok = &.{};
+            if (ri < body.len) {
+                if (paramIndex(m, body[ri])) |pi| {
+                    if (args[pi].len > 0) {
+                        right = args[pi][0].tok;
+                        rest = args[pi][1..];
+                    }
+                } else right = body[ri];
+            }
+            if (left != null and right != null) {
+                if (try p.paste(left.?, right.?)) |tok| try out.append(p.arena, .{ .tok = tok, .hide = base_hide });
+            } else if (left) |l| {
+                try out.append(p.arena, .{ .tok = l, .hide = base_hide });
+            } else if (right) |r| {
+                try out.append(p.arena, .{ .tok = r, .hide = base_hide });
+            }
+            for (rest) |a| try out.append(p.arena, .{ .tok = a.tok, .hide = base_hide });
+            i = if (ri < body.len) ri + 1 else ri;
+            continue;
+        }
+        // `#` stringize: a single `#` before a parameter.
+        if (body[i].kind == .hash and i + 1 < body.len) {
+            if (paramIndex(m, body[i + 1])) |pi| {
+                const s = try p.stringize(args[pi]);
+                try out.append(p.arena, .{ .tok = .{ .kind = .{ .str = s } }, .hide = base_hide });
+                i += 2;
+                continue;
+            }
+            if (isVaArgs(m, body[i + 1])) {
+                const s = try p.stringize(try p.vaRaw(m, args));
+                try out.append(p.arena, .{ .tok = .{ .kind = .{ .str = s } }, .hide = base_hide });
+                i += 2;
+                continue;
+            }
+        }
+        // A parameter (not consumed as a `##` right operand above): raw when it
+        // is the left operand of a following `##`, else pre-expanded.
+        if (paramIndex(m, body[i])) |pi| {
+            if (isPasteOp(body, i + 1)) {
+                for (args[pi]) |a| try out.append(p.arena, .{ .tok = a.tok, .hide = base_hide });
+            } else {
+                try out.appendSlice(p.arena, try p.expandArg(args[pi]));
+            }
+            i += 1;
+            continue;
+        }
+        if (isVaArgs(m, body[i])) {
+            const va = try p.vaRaw(m, args);
+            if (isPasteOp(body, i + 1)) {
+                for (va) |a| try out.append(p.arena, .{ .tok = a.tok, .hide = base_hide });
+            } else {
+                try out.appendSlice(p.arena, try p.expandArg(va));
+            }
+            i += 1;
+            continue;
+        }
+        try out.append(p.arena, .{ .tok = body[i], .hide = base_hide });
+        i += 1;
+    }
+    return out.items;
 }
 
 // ---- free helpers ----
@@ -1034,9 +1629,8 @@ fn targetMacros(tgt: target_mod.Target) []const Define {
 /// Concatenates two small comptime-backed Define slices without allocating,
 /// by returning a slice of a static table when possible.
 fn concatDefines(a: []const Define, b: []const Define) []const Define {
-    // The combinations are tiny; build a global fixed table lazily is
-    // overkill. Since callers immediately copy the macros into the table via
-    // addDefines, use a static thread-local scratch.
+    // The combinations are tiny and callers copy the macros out immediately via
+    // addDefines, so a thread-local scratch buffer suffices.
     const S = struct {
         threadlocal var buf: [8]Define = undefined;
     };
@@ -1118,6 +1712,88 @@ test "define body is a token sequence and undef removes it" {
     try testing.expectEqualStrings("TWO", toks[3].kind.ident);
 }
 
+test "function-like macro expands with arguments" {
+    var t = try TestPp.init(
+        \\#define SQ(x) ((x) * (x))
+        \\SQ(3 + 1)
+    , .{ .inject_prelude = false });
+    defer t.deinit();
+    const toks = try t.drain();
+    // ((3 + 1) * (3 + 1)), 13 tokens.
+    try testing.expectEqual(@as(usize, 13), toks.len);
+    try testing.expect(toks[0].kind == .l_paren);
+    try testing.expectEqual(@as(i64, 3), toks[2].kind.int);
+    try testing.expect(toks[6].kind == .star);
+}
+
+test "function-like name without parens stays an identifier" {
+    var t = try TestPp.init(
+        \\#define F(x) x
+        \\F + F(5)
+    , .{ .inject_prelude = false });
+    defer t.deinit();
+    const toks = try t.drain();
+    // The bare F is left alone; F(5) expands to 5.
+    try testing.expectEqual(@as(usize, 3), toks.len);
+    try testing.expectEqualStrings("F", toks[0].kind.ident);
+    try testing.expect(toks[1].kind == .plus);
+    try testing.expectEqual(@as(i64, 5), toks[2].kind.int);
+}
+
+test "argument pre-expansion: nested calls and STR/XSTR idiom" {
+    var t = try TestPp.init(
+        \\#define STR(x) #x
+        \\#define XSTR(x) STR(x)
+        \\#define VER 3
+        \\STR(VER) XSTR(VER)
+    , .{ .inject_prelude = false });
+    defer t.deinit();
+    const toks = try t.drain();
+    // STR(VER) is raw -> "VER"; XSTR(VER) pre-expands -> "3".
+    try testing.expectEqual(@as(usize, 2), toks.len);
+    try testing.expectEqualStrings("VER", toks[0].kind.str);
+    try testing.expectEqualStrings("3", toks[1].kind.str);
+}
+
+test "token paste with ##" {
+    var t = try TestPp.init(
+        \\#define CAT(a, b) a ## b
+        \\CAT(foo, bar)
+    , .{ .inject_prelude = false });
+    defer t.deinit();
+    const toks = try t.drain();
+    try testing.expectEqual(@as(usize, 1), toks.len);
+    try testing.expectEqualStrings("foobar", toks[0].kind.ident);
+}
+
+test "variadic macro and GNU comma elision" {
+    var t = try TestPp.init(
+        \\#define P(fmt, ...) fmt, ## __VA_ARGS__
+        \\P(1)
+        \\P(1, 2, 3)
+    , .{ .inject_prelude = false });
+    defer t.deinit();
+    const toks = try t.drain();
+    // P(1) -> 1 (comma dropped); P(1,2,3) -> 1 , 2 , 3
+    try testing.expectEqual(@as(usize, 6), toks.len);
+    try testing.expectEqual(@as(i64, 1), toks[0].kind.int);
+    try testing.expectEqual(@as(i64, 1), toks[1].kind.int);
+    try testing.expect(toks[2].kind == .comma);
+    try testing.expectEqual(@as(i64, 2), toks[3].kind.int);
+    try testing.expect(toks[4].kind == .comma);
+    try testing.expectEqual(@as(i64, 3), toks[5].kind.int);
+}
+
+test "wrong function-like macro arity is rejected" {
+    var t = try TestPp.init(
+        \\#define ADD(a, b) a + b
+        \\ADD(1)
+    , .{ .inject_prelude = false });
+    defer t.deinit();
+    try testing.expectError(error.CompileFailed, t.drain());
+    try testing.expect(std.mem.indexOf(u8, t.diags.firstError().?.message, "expects 2") != null);
+}
+
 test "conditionals: ifdef/else/endif and #if expressions" {
     var t = try TestPp.init(
         \\#define YES 1
@@ -1180,10 +1856,78 @@ test "unbalanced #if is reported at end of file" {
     try testing.expect(std.mem.indexOf(u8, t.diags.firstError().?.message, "missing #endif") != null);
 }
 
-test "#exe is rejected" {
-    var t = try TestPp.init("#exe {1;}\n", .{ .inject_prelude = false });
+test "#exe with no executor is skipped, not an error" {
+    // The language server runs the frontend without an executor; an #exe file
+    // must still analyze without a spurious error. The block is dropped and the
+    // following code resumes.
+    var t = try TestPp.init("#exe { anything(); }\n30\n", .{ .inject_prelude = false });
     defer t.deinit();
-    try testing.expectError(error.CompileFailed, t.pp.next());
+    const toks = try t.drain();
+    try testing.expectEqual(@as(usize, 1), toks.len);
+    try testing.expectEqual(@as(i64, 30), toks[0].kind.int);
+}
+
+/// A fake #exe executor for the hermetic tests: it ignores the unit and splices
+/// a fixed source string, so the splice/resume machinery is exercised without
+/// the backend (which the frontend module must not link).
+fn fakeExeRunner(ctx: *anyopaque, arena: std.mem.Allocator, io: std.Io, unit: []const u8, base_dir: []const u8) ExeResult {
+    _ = arena;
+    _ = io;
+    _ = unit;
+    _ = base_dir;
+    const out: *const []const u8 = @ptrCast(@alignCast(ctx));
+    return .{ .ok = out.* };
+}
+
+test "#exe splices the executor output as source" {
+    var generated: []const u8 = "10 + 20";
+    var t = try TestPp.init("#exe { anything }\n30\n", .{
+        .inject_prelude = false,
+        .exe_runner = fakeExeRunner,
+        .exe_ctx = @ptrCast(&generated),
+    });
+    defer t.deinit();
+    const toks = try t.drain();
+    // The spliced "10 + 20" streams in where the directive stood, then the 30
+    // that followed it resumes after the generated frame.
+    try testing.expectEqual(@as(usize, 4), toks.len);
+    try testing.expectEqual(@as(i64, 10), toks[0].kind.int);
+    try testing.expect(toks[1].kind == .plus);
+    try testing.expectEqual(@as(i64, 20), toks[2].kind.int);
+    try testing.expectEqual(@as(i64, 30), toks[3].kind.int);
+}
+
+test "#exe multi-line block with nested braces, then following code resumes" {
+    var generated: []const u8 = "1";
+    var t = try TestPp.init(
+        \\#exe {
+        \\  if (x) { y; }
+        \\}
+        \\2
+    , .{
+        .inject_prelude = false,
+        .exe_runner = fakeExeRunner,
+        .exe_ctx = @ptrCast(&generated),
+    });
+    defer t.deinit();
+    const toks = try t.drain();
+    // The nested { } inside the block does not end it early; the block is
+    // replaced by "1" and the trailing 2 resumes after it.
+    try testing.expectEqual(@as(usize, 2), toks.len);
+    try testing.expectEqual(@as(i64, 1), toks[0].kind.int);
+    try testing.expectEqual(@as(i64, 2), toks[1].kind.int);
+}
+
+test "unterminated #exe block is reported" {
+    var generated: []const u8 = "";
+    var t = try TestPp.init("#exe { no close brace\n", .{
+        .inject_prelude = false,
+        .exe_runner = fakeExeRunner,
+        .exe_ctx = @ptrCast(&generated),
+    });
+    defer t.deinit();
+    try testing.expectError(error.CompileFailed, t.drain());
+    try testing.expect(std.mem.indexOf(u8, t.diags.firstError().?.message, "unterminated") != null);
 }
 
 test "prelude injection streams the whole embedded library" {
@@ -1266,6 +2010,132 @@ test "disk includes: relative, nested, upward search, and cycles" {
         defer t.deinit();
         try testing.expectError(error.CompileFailed, t.pp.next());
     }
+}
+
+test "angle-bracket includes resolve against the search path in order" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "a");
+    try tmp.dir.createDirPath(io, "b");
+    try tmp.dir.createDirPath(io, "pkg/example.com/lib");
+    // Dup.HC exists in both roots; the first on the path must win.
+    try tmp.dir.writeFile(io, .{ .sub_path = "a/Dup.HC", .data = "10\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b/Dup.HC", .data = "20\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b/Only.HC", .data = "30\n" });
+    // A domain-qualified (subdir) name, as a third-party package would use.
+    try tmp.dir.writeFile(io, .{ .sub_path = "pkg/example.com/lib/Pkg.HC", .data = "40\n" });
+
+    const a = try tmp.dir.realPathFileAlloc(io, "a", testing.allocator);
+    defer testing.allocator.free(a);
+    const b = try tmp.dir.realPathFileAlloc(io, "b", testing.allocator);
+    defer testing.allocator.free(b);
+    const pkg = try tmp.dir.realPathFileAlloc(io, "pkg", testing.allocator);
+    defer testing.allocator.free(pkg);
+    const path = [_][]const u8{ a, b, pkg };
+
+    {
+        // Dup resolves in `a` (10, not `b`'s 20); Only only in `b` (30); Pkg by
+        // its subdir path under `pkg` (40). The header name is recovered from
+        // the raw `<...>` span, which the token stream doesn't preserve.
+        var t = try TestPp.init(
+            "#include <Dup.HC>\n#include <Only.HC>\n#include <example.com/lib/Pkg.HC>\n",
+            .{ .inject_prelude = false, .include_path = &path },
+        );
+        defer t.deinit();
+        const toks = try t.drain();
+        try testing.expectEqual(@as(usize, 3), toks.len);
+        try testing.expectEqual(@as(i64, 10), toks[0].kind.int);
+        try testing.expectEqual(@as(i64, 30), toks[1].kind.int);
+        try testing.expectEqual(@as(i64, 40), toks[2].kind.int);
+    }
+    {
+        // Not on any root → a clear "include path" error.
+        var t = try TestPp.init("#include <Nope.HC>\n", .{
+            .inject_prelude = false,
+            .include_path = &path,
+        });
+        defer t.deinit();
+        try testing.expectError(error.CompileFailed, t.pp.next());
+        try testing.expect(std.mem.indexOf(u8, t.diags.firstError().?.message, "include path") != null);
+    }
+}
+
+test "an hcc.toml alias expands to its import path in angle includes" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "pkg/example.com/lib");
+    try tmp.dir.writeFile(io, .{ .sub_path = "pkg/example.com/lib/Pkg.HC", .data = "40\n" });
+
+    const pkg = try tmp.dir.realPathFileAlloc(io, "pkg", testing.allocator);
+    defer testing.allocator.free(pkg);
+    const path = [_][]const u8{pkg};
+
+    // hcc.toml aliases `lib` to the import path `example.com/lib`.
+    var aliases: std.StringHashMapUnmanaged([]const u8) = .empty;
+    defer aliases.deinit(testing.allocator);
+    try aliases.put(testing.allocator, "lib", "example.com/lib");
+
+    {
+        // <lib/Pkg.HC> expands to <example.com/lib/Pkg.HC> and resolves (40).
+        var t = try TestPp.init(
+            "#include <lib/Pkg.HC>\n",
+            .{ .inject_prelude = false, .include_path = &path, .aliases = aliases },
+        );
+        defer t.deinit();
+        const toks = try t.drain();
+        try testing.expectEqual(@as(usize, 1), toks.len);
+        try testing.expectEqual(@as(i64, 40), toks[0].kind.int);
+    }
+    {
+        // The full import path still works with the alias map present.
+        var t = try TestPp.init(
+            "#include <example.com/lib/Pkg.HC>\n",
+            .{ .inject_prelude = false, .include_path = &path, .aliases = aliases },
+        );
+        defer t.deinit();
+        const toks = try t.drain();
+        try testing.expectEqual(@as(usize, 1), toks.len);
+        try testing.expectEqual(@as(i64, 40), toks[0].kind.int);
+    }
+    {
+        // An unknown leading segment is left untouched (no false expansion).
+        var t = try TestPp.init("#include <nope/Pkg.HC>\n", .{
+            .inject_prelude = false,
+            .include_path = &path,
+            .aliases = aliases,
+        });
+        defer t.deinit();
+        try testing.expectError(error.CompileFailed, t.pp.next());
+        try testing.expect(std.mem.indexOf(u8, t.diags.firstError().?.message, "include path") != null);
+    }
+}
+
+test "a local (absolute) alias resolves directly, off the search path" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "mylib");
+    try tmp.dir.writeFile(io, .{ .sub_path = "mylib/Sub.HC", .data = "50\n" });
+
+    const libdir = try tmp.dir.realPathFileAlloc(io, "mylib", testing.allocator);
+    defer testing.allocator.free(libdir);
+
+    // A local submodule alias maps to an absolute directory.
+    var aliases: std.StringHashMapUnmanaged([]const u8) = .empty;
+    defer aliases.deinit(testing.allocator);
+    try aliases.put(testing.allocator, "sub", libdir);
+
+    // No include_path at all: the alias resolves straight to the file.
+    var t = try TestPp.init(
+        "#include <sub/Sub.HC>\n",
+        .{ .inject_prelude = false, .aliases = aliases },
+    );
+    defer t.deinit();
+    const toks = try t.drain();
+    try testing.expectEqual(@as(usize, 1), toks.len);
+    try testing.expectEqual(@as(i64, 50), toks[0].kind.int);
 }
 
 test "include guards make double inclusion a no-op" {

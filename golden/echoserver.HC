@@ -2,6 +2,9 @@
 // listens, accepts, and echoes; a Thread()-spawned client connects, sends,
 // and reads the echo back. All printing happens on the main thread so the
 // golden's ordering is deterministic.
+#include <File.HC> // Read/Write/Close
+#include <Net.HC>  // Socket/Bind/Listen/Accept/Connect/…
+#include <Sync.HC> // Thread/Join
 
 #define PORT 43217
 

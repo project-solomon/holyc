@@ -20,7 +20,7 @@ pub fn build(b: *std.Build) void {
 
     // The front end as a reusable module: lex → preprocess → parse → reflect →
     // check → layout. Links nothing; the CLI, the backend, the language
-    // server, and the integration harness all consume it as "hcc".
+    // server, and the e2e harness all consume it as "hcc".
     const frontend_mod = b.addModule("frontend", .{
         .root_source_file = b.path("hcc/frontend/root.zig"),
         .target = target,
@@ -61,6 +61,18 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(exe);
 
+    // The standard library ships as on-disk source inside the self-contained
+    // toolchain tree, at <root>/std — where hcc discovers it as HCC_ROOT/std
+    // (HCC_ROOT being the parent of its own bin dir). Installing it under the
+    // build prefix means a bare `zig build` yields a self-consistent tree:
+    // zig-out/bin/hcc resolves #include <Str.HC> against zig-out/std, no install.
+    const std_install = b.addInstallDirectory(.{
+        .source_dir = b.path("std"),
+        .install_dir = .prefix,
+        .install_subdir = "std",
+    });
+    b.getInstallStep().dependOn(&std_install.step);
+
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_cmd.addArgs(args);
@@ -89,6 +101,7 @@ pub fn build(b: *std.Build) void {
     // through the default install step, which links hcc against libLLVM.
     const hcc_step = b.step("hcc", "Build and install only the hcc compiler");
     hcc_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
+    hcc_step.dependOn(&std_install.step); // ship the stdlib source with hcc
     const lsp_step = b.step("lsp", "Build and install only the holyc-lsp language server (no LLVM needed)");
     lsp_step.dependOn(&b.addInstallArtifact(lsp_exe, .{}).step);
 
@@ -99,21 +112,30 @@ pub fn build(b: *std.Build) void {
     const lsp_tests = b.addTest(.{ .root_module = lsp_mod });
     const run_lsp_tests = b.addRunArtifact(lsp_tests);
 
-    // The integration harness: a standalone black-box driver with NO code
+    // hcc.toml manifest parser/editor: a standalone, dependency-free module
+    // (pure string handling), so it is tested on its own.
+    const mod_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("hcc/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    const run_mod_tests = b.addRunArtifact(mod_tests);
+
+    // The e2e harness: a standalone black-box driver with NO code
     // dependency on the compiler — it invokes the installed `hcc` from the
     // PATH (install.sh builds and installs it; the Makefile's `test` target
     // wires the two together) and reads the fixtures from disk.
-    const integration_exe = b.addExecutable(.{
-        .name = "integration",
+    const e2e_exe = b.addExecutable(.{
+        .name = "e2e",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("integration/main.zig"),
+            .root_source_file = b.path("e2e/main.zig"),
             .target = target,
             .optimize = optimize,
         }),
     });
-    b.installArtifact(integration_exe);
+    b.installArtifact(e2e_exe);
 
-    // The benchmark harness: same standalone shape as integration — it
+    // The benchmark harness: same standalone shape as e2e — it
     // invokes the installed `hcc` from the PATH (the Makefile's `bench`
     // target) and times it against clang -O0..-O3 over .HC/.c fixture pairs.
     // Always ReleaseFast: the harness itself must not add measurement noise.
@@ -127,8 +149,9 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(bench_exe);
 
-    const test_step = b.step("test", "Run the frontend, backend, and LSP unit tests (see `make test` for the fixture integration run)");
+    const test_step = b.step("test", "Run the frontend, backend, and LSP unit tests (see `make test` for the fixture e2e run)");
     test_step.dependOn(&run_frontend_tests.step);
     test_step.dependOn(&run_llvm_tests.step);
     test_step.dependOn(&run_lsp_tests.step);
+    test_step.dependOn(&run_mod_tests.step);
 }

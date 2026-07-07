@@ -1,0 +1,11 @@
+SQ(3+1)      = 16
+ADD(SQ(3),8) = 17
+APPLY(SQ,5)  = 25
+STR(VER)     = VER
+XSTR(VER)    = 3
+CAT(val_,hi) = 111
+bare SQ      = 42
+va: 7 8
+elision: none
+elision: 5
+#if with a function-like macro

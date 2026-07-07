@@ -1,9 +1,11 @@
-//! The always-resident HolyC prelude (the predefined constants, CTask, the
-//! print core, and the compiler-intrinsic prototypes), embedded into the hcc
-//! binary from `hcc/frontend/core/`. The preprocessor injects it ahead of every
-//! program (`Preprocessor.injectPrelude`), resolving the prelude's own
-//! #includes against this table; user code may not #include these files
-//! directly, since they are implicit and always in scope.
+//! The always-resident HolyC prelude: predefined constants, CTask (exceptions),
+//! the print core (StrPrint), and reflection (KClass). Embedded into the hcc
+//! binary from `hcc/frontend/core/`. The hosted runtime (heap, I/O, threads)
+//! lives in the on-disk standard library (`std/`), opt-in per program.
+//! The preprocessor injects the prelude ahead of every program
+//! (`Preprocessor.injectPrelude`), resolving the prelude's own #includes against
+//! this table. User code may not #include these files directly; they are
+//! implicit and always in scope.
 
 const std = @import("std");
 
@@ -23,15 +25,8 @@ pub const files = [_]File{
     .{ .path = "Lib.HC", .contents = @embedFile("core/Lib.HC") },
     .{ .path = "KConfig.HC", .contents = @embedFile("core/KConfig.HC") },
     .{ .path = "CTask.HC", .contents = @embedFile("core/CTask.HC") },
-    .{ .path = "MAllocFree.HC", .contents = @embedFile("core/MAllocFree.HC") },
-    .{ .path = "Time.HC", .contents = @embedFile("core/Time.HC") },
     .{ .path = "StrPrint.HC", .contents = @embedFile("core/StrPrint.HC") },
     .{ .path = "KClass.HC", .contents = @embedFile("core/KClass.HC") },
-    .{ .path = "Proc.HC", .contents = @embedFile("core/Proc.HC") },
-    .{ .path = "File.HC", .contents = @embedFile("core/File.HC") },
-    .{ .path = "Net.HC", .contents = @embedFile("core/Net.HC") },
-    .{ .path = "Thread.HC", .contents = @embedFile("core/Thread.HC") },
-    .{ .path = "Atomic.HC", .contents = @embedFile("core/Atomic.HC") },
 };
 
 /// The contents of the prelude file at an (already normalized, forward-slash)
@@ -49,7 +44,7 @@ pub fn exists(path: []const u8) bool {
 
 test "root file is present and non-empty" {
     try std.testing.expect(get(root).?.len > 0);
-    try std.testing.expect(exists("MAllocFree.HC"));
+    try std.testing.expect(exists("StrPrint.HC"));
     try std.testing.expect(!exists("NotAFile.HC"));
 }
 

@@ -3,7 +3,7 @@
 //! link). This is the only module that links libLLVM (see build.zig); it
 //! consumes the checked AST through the `hcc` front-end module.
 //!
-//! Note: no source FILE in here may be named llvm.zig — Zig mangles decls as
+//! No source FILE in here may be named llvm.zig: Zig mangles decls as
 //! "<file>.<decl>", and LLVM rejects symbols in its reserved "llvm." intrinsic
 //! namespace. The directory name is fine, as are c.zig and backend.zig.
 

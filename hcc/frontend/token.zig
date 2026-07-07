@@ -4,9 +4,8 @@ const std = @import("std");
 const source = @import("source.zig");
 
 /// A HolyC keyword: a reserved word or built-in type name. The lexer recognises
-/// keywords directly (`Keyword.fromString`), so the parser never
-/// string-compares identifiers. Each tag's name is the keyword's exact source
-/// spelling.
+/// keywords directly (`Keyword.fromString`), so the parser never string-compares
+/// identifiers. Each tag's name is the keyword's exact source spelling.
 pub const Keyword = enum {
     // Built-in types. HolyC's default integer is I64 and there is no F32.
     U0,
@@ -70,8 +69,8 @@ pub const Keyword = enum {
     @"extern",
 
     // Reserved HolyC keywords: lexed so they stay reserved words (using one as
-    // an identifier is rejected, matching TempleOS), but the feature behind
-    // each is not implemented. Neither is matched by the parser.
+    // an identifier is rejected, matching TempleOS), but unimplemented. Neither
+    // is matched by the parser.
     lastclass,
     no_warn,
 
@@ -106,8 +105,8 @@ pub const Keyword = enum {
 };
 
 /// A lexed token: its kind (with the decoded payload for literal kinds) and
-/// where it came from. Comparing against a payload-free kind is just
-/// `tok.kind == .plus`; payload kinds are matched with a switch capture.
+/// where it came from. Compare against a payload-free kind with
+/// `tok.kind == .plus`; match payload kinds with a switch capture.
 pub const Token = struct {
     kind: Kind,
     span: source.Span = .{},

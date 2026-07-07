@@ -85,7 +85,7 @@ pub fn parse(p: *Parser) Error!ast.Program {
     // Anonymous aggregate types synthesized anywhere (including inside
     // function bodies) are appended as top-level ClassDefs so they reach the
     // type table. The layout pass is order-independent, so trailing
-    // definitions resolve fine.
+    // definitions resolve.
     try items.appendSlice(p.arena, p.hoisted.items);
     p.hoisted.clearRetainingCapacity();
     return .{
@@ -1292,7 +1292,7 @@ fn parseClass(p: *Parser, m: Mark, is_public: bool) Error!*ast.Stmt {
 /// Whether one or more variable declarators follow a class body
 /// (`class Foo {…} a, b;`), distinguishing them from a following statement: it
 /// accepts `(*)* Ident` followed by `,`, `;`, `=`, or `[`. So
-/// `class P {…} OtherType y;` is correctly left as a separate declaration.
+/// `class P {…} OtherType y;` stays a separate declaration.
 fn looksLikeInlineInstance(p: *Parser) Error!bool {
     var i: usize = 0;
     while (true) {
@@ -1374,8 +1374,8 @@ fn parseClassFields(p: *Parser) Error![]const ast.Declarator {
 
 /// Parses HolyC member metadata that may follow a class-field declarator: zero
 /// or more `key value` pairs, where key is an identifier (e.g. `format`,
-/// `data`) and value is a string or integer literal. It stops at the `,` or
-/// `;` that ends the declarator.
+/// `data`) and value is a string or integer literal. Stops at the `,` or `;`
+/// that ends the declarator.
 fn parseFieldMeta(p: *Parser) Error![]const ast.FieldMeta {
     var meta: std.ArrayList(ast.FieldMeta) = .empty;
     while (try p.at(.ident)) {

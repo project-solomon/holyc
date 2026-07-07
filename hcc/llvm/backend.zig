@@ -1,7 +1,7 @@
-//! hcc's one and only code generator: drives the LLVM-C API (linked
-//! in-process from the system LLVM; see build.zig's -Dllvm-prefix) to
-//! translate the checked AST into an LLVM module, verify and optimize it, emit
-//! a native object, and link the final artifact with the host C toolchain.
+//! Code generator: drives the LLVM-C API (linked in-process from the system
+//! LLVM; see build.zig's -Dllvm-prefix) to translate the checked AST into an
+//! LLVM module, verify and optimize it, emit a native object, and link the
+//! final artifact with the host C toolchain.
 
 const std = @import("std");
 const c = @import("c.zig");
@@ -77,8 +77,8 @@ pub fn emit(
             triple, if (err_msg) |m| std.mem.span(m) else "unknown error",
         });
     }
-    // riscv64 needs its baseline spelled out: bare "generic" is RV64I only —
-    // no multiply, no atomics, no hardware float — and Linux userland is
+    // riscv64 needs its baseline spelled out: bare "generic" is RV64I only
+    // (no multiply, no atomics, no hardware float), and Linux userland is
     // RV64GC with the lp64d ABI (which requires D). amd64/arm64 baselines
     // already include everything the lowering emits.
     const features: [*:0]const u8 = switch (opts.target.arch) {
@@ -151,11 +151,11 @@ pub fn emit(
     try link(arena, diags, io, obj_path, opts);
 }
 
-/// Links through a C compiler driver (the same move clang itself makes): it
-/// brings in crt, libc, and the platform linker. The driver is opts.cc when
-/// given; otherwise the system `cc` for the host target, or `zig cc -target
-/// <triple>` for a cross target (Zig ships headers and libc stubs for every
-/// triple hcc supports, so no sysroot setup is needed).
+/// Links through a C compiler driver, which brings in crt, libc, and the
+/// platform linker. The driver is opts.cc when given; otherwise the system
+/// `cc` for the host target, or `zig cc -target <triple>` for a cross target
+/// (Zig ships headers and libc stubs for every triple hcc supports, so no
+/// sysroot setup is needed).
 fn link(arena: std.mem.Allocator, diags: *diag.Diagnostics, io: std.Io, obj_path: []const u8, opts: Options) Error!void {
     const host = std.meta.eql(opts.target, target_mod.Target.host());
     var argv: std.ArrayList([]const u8) = .empty;
