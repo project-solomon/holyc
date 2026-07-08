@@ -1,11 +1,10 @@
-//! The LLVM backend as its own module: bindings for the LLVM-C API, the
-//! AST→LLVM-IR lowering, and the emit pipeline (verify → optimize → object →
-//! link). This is the only module that links libLLVM (see build.zig); it
-//! consumes the checked AST through the `hcc` front-end module.
+//! The LLVM backend module: LLVM-C API bindings, AST→LLVM-IR lowering, and the
+//! emit pipeline (verify, optimize, object, link). The only module that links
+//! libLLVM (see build.zig); it consumes the checked AST from the `hcc` module.
 //!
-//! No source FILE in here may be named llvm.zig: Zig mangles decls as
+//! No source file here may be named llvm.zig: Zig mangles decls as
 //! "<file>.<decl>", and LLVM rejects symbols in its reserved "llvm." intrinsic
-//! namespace. The directory name is fine, as are c.zig and backend.zig.
+//! namespace. The directory name, c.zig, and backend.zig are fine.
 
 pub const c = @import("c.zig");
 pub const lower = @import("lower.zig");

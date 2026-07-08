@@ -1,28 +1,26 @@
 //! The HolyC preprocessor.
 //!
 //! A Preprocessor wraps the lexers and is itself a token source (it has `next`,
-//! so the parser reads from it directly). It slots between the lexer and the
-//! parser and never materialises the whole token list. As tokens flow through:
+//! so the parser reads from it directly). It never materialises the whole token
+//! list. As tokens flow through:
 //!
-//!   - #define / #undef build and tear down a macro table. HolyC has only
-//!     object-like macros (no function-like macros); they are expanded inline,
-//!     with a hide-set guarding against self-reference.
+//!   - #define / #undef build and tear down the macro table. Macros are
+//!     expanded inline, with a hide-set guarding against self-reference.
 //!   - #include "file" reads the file and pushes it onto a source stack, so its
-//!     tokens splice in where the directive appeared. The path resolves
-//!     relative to the including file's directory; a `::`-prefixed path
-//!     (TempleOS-style) searches the current directory and each ancestor.
-//!     Cycles and excessive nesting are rejected.
+//!     tokens splice in where the directive appeared. The path resolves relative
+//!     to the including file's directory; a `::`-prefixed path (TempleOS-style)
+//!     searches the current directory and each ancestor. Cycles and excessive
+//!     nesting are rejected.
 //!   - #if / #ifdef / #ifndef / #elif / #else / #endif select compilation
 //!     regions. #ifdef / #ifndef test the macro table; #if / #elif evaluate an
 //!     integer constant expression over the same macros, with `defined NAME` /
-//!     `defined(NAME)` and undefined names taken as 0 (C rules), using HolyC
-//!     operator precedence. Tokens (and ordinary directives) in an unselected
-//!     region are dropped. The primary use is include guards, so a file is
-//!     processed at most once.
+//!     `defined(NAME)` and undefined names taken as 0 (C rules), in HolyC
+//!     operator precedence. Tokens in an unselected region are dropped. Mainly
+//!     used for include guards.
 //!
 //! Directives run to the end of their line. The lexer discards newlines, but
-//! every token carries span.pos.line, so the preprocessor finds line
-//! boundaries from token positions; no newline tokens needed.
+//! every token carries span.pos.line, so line boundaries come from token
+//! positions; no newline tokens needed.
 
 const std = @import("std");
 const source = @import("source.zig");
@@ -37,23 +35,23 @@ const Preprocessor = @This();
 
 pub const Error = diag.Error;
 
-/// A hard cap on #include nesting, a backstop beyond the cycle guard.
+/// Hard cap on #include nesting, a backstop beyond the cycle guard.
 const max_include_depth = 64;
 
-/// The outcome of running an #exe block: either the program's captured stdout
-/// (spliced back in as source) or a human-readable failure message.
+/// The outcome of running an #exe block: the program's captured stdout (spliced
+/// back in as source) or a failure message.
 pub const ExeResult = union(enum) {
     ok: []const u8,
     err: []const u8,
 };
 
 /// Runs one #exe block's compile-time program and returns its stdout. The
-/// preprocessor lives in the frontend module, which links no backend, so the
-/// driver injects this: it sub-compiles `unit` (the file up to the directive
-/// plus the block body as top-level statements), runs the host executable, and
-/// captures stdout. `ctx` is the opaque driver state passed alongside the fn;
-/// `base_dir` fixes where the unit's relative #includes resolve. The returned
-/// bytes must outlive the splice, so they are allocated in `arena`.
+/// frontend module links no backend, so the driver injects this: it
+/// sub-compiles `unit` (the file up to the directive plus the block body as
+/// top-level statements), runs the host executable, and captures stdout. `ctx`
+/// is the opaque driver state; `base_dir` fixes where the unit's relative
+/// #includes resolve. The returned bytes must outlive the splice, so they are
+/// allocated in `arena`.
 pub const ExeRunner = *const fn (
     ctx: *anyopaque,
     arena: std.mem.Allocator,
@@ -63,26 +61,40 @@ pub const ExeRunner = *const fn (
 ) ExeResult;
 
 /// A compiler-predefined object-like macro: NAME expands to the integer value
-/// (or 1 when value is not a decimal integer). Used to seed platform macros.
+/// (or 1 when value is not a decimal integer). Seeds platform macros.
 pub const Define = struct {
     name: []const u8,
     value: []const u8,
 };
 
-/// One entry in the macro table. An object-like macro has `params == null` and
-/// is its replacement body. A function-like macro (a C extension over
-/// TempleOS HolyC) carries a parameter list and is only expanded when its name
-/// is followed by `(`; `variadic` marks a trailing `...` whose extra arguments
-/// gather into `__VA_ARGS__`.
+/// One macro-table entry. An object-like macro has `params == null` and is its
+/// replacement body. A function-like macro (a C extension over TempleOS HolyC)
+/// carries a parameter list and expands only when its name is followed by `(`;
+/// `variadic` marks a trailing `...` whose extra arguments gather into
+/// `__VA_ARGS__`.
 const Macro = struct {
     params: ?[]const []const u8 = null,
     variadic: bool = false,
     body: []const Token,
+    /// Span of the macro name at its #define site, for go-to-definition. A file
+    /// of `predefined_macro_file` marks a compiler-injected macro (__HCC__, the
+    /// target macros) with no source location.
+    def: source.Span = .{ .file = predefined_macro_file },
 };
 
-/// The set of macro names that must not be re-expanded within a token: an
-/// immutable cons list in the arena (macros are object-like only, so the set
-/// grows one name per expansion level).
+/// Sentinel `def.file` for a compiler-injected macro, which has no source
+/// location to jump to.
+pub const predefined_macro_file: u32 = std.math.maxInt(u32);
+
+/// A macro name paired with its definition site, for go-to-definition. Built
+/// after a run via `macroDefs`.
+pub const MacroDef = struct {
+    name: []const u8,
+    def: source.Span,
+};
+
+/// Macro names that must not be re-expanded within a token: an immutable cons
+/// list in the arena, growing one name per expansion level.
 const HideSet = struct {
     name: []const u8,
     parent: ?*const HideSet,
@@ -106,25 +118,24 @@ const PpTok = struct {
 const Frame = struct {
     /// Lexer streaming the included file's tokens.
     lexer: Lexer,
-    /// Tokens read past the directive that opened this frame (the single token
-    /// parked past an #include line, or the same-line leftovers after an #exe
-    /// block), replayed in order once the frame is exhausted.
+    /// Tokens read past the directive that opened this frame (the token parked
+    /// past an #include line, or same-line leftovers after an #exe block),
+    /// replayed in order once the frame is exhausted.
     resume_toks: []const Token,
     /// This file's directory, for its own relative #includes.
     dir: []const u8,
     /// Canonical path, for cycle detection ("fs:"-prefixed for embedded files).
     path: []const u8,
     /// Whether this frame's source and its relative #includes resolve against
-    /// the embedded prelude table rather than the disk. Inherited by every
-    /// file the frame #includes.
+    /// the embedded core table rather than disk. Inherited by every file the
+    /// frame #includes.
     embedded: bool,
     /// Index into `files`, stamped onto this frame's tokens.
     file_id: u32,
 };
 
 /// One open conditional-compilation group (#if/#ifdef/#ifndef … #endif). The
-/// preprocessor consults the innermost frame to decide whether tokens and
-/// ordinary directives in the current region are live.
+/// innermost frame decides whether the current region is live.
 const CondState = struct {
     /// Was the enclosing region emitting when this group opened?
     parent_active: bool,
@@ -135,84 +146,71 @@ const CondState = struct {
     /// Has #else been seen? (a later #elif/#else is then an error)
     saw_else: bool = false,
     /// includes.items.len when the group opened, so an #if must be closed by an
-    /// #endif within the same file (an unbalanced one is reported at that
-    /// file's end).
+    /// #endif in the same file (an unbalanced one is reported at that file's
+    /// end).
     frame_depth: usize,
 };
 
 arena: std.mem.Allocator,
 diags: *diag.Diagnostics,
-/// The I/O interface disk #includes resolve through.
+/// I/O interface disk #includes resolve through.
 io: std.Io,
 /// The base (top-level) source lexer, file 0.
 inner: Lexer,
-/// A one-token push-back for the inner stream. A directive sometimes reads one
+/// One-token push-back for the inner stream. A directive sometimes reads one
 /// token past its line and parks it here.
 lookahead: ?Token = null,
-/// Tokens to replay before anything else, nearest LAST (LIFO). A frame's
-/// resume tokens land here when it is exhausted, so they stream out ahead of
-/// the enclosing source; the parser never sees them out of order.
+/// Tokens to replay before anything else, nearest LAST (LIFO). A frame's resume
+/// tokens land here when it is exhausted, so they stream out ahead of the
+/// enclosing source, never out of order.
 pushback: std.ArrayList(Token) = .empty,
-/// Buffered, expanded tokens awaiting output. Stored as a stack with the
-/// nearest token LAST, so taking the front and prepending macro expansions are
-/// both O(1).
+/// Buffered, expanded tokens awaiting output. A stack with the nearest token
+/// LAST, so taking the front and prepending macro expansions are both O(1).
 pending: std.ArrayList(PpTok) = .empty,
 macros: std.StringArrayHashMapUnmanaged(Macro) = .empty,
 base_dir: []const u8,
-/// Ordered directories searched for angle-bracket #include <...> (library and
-/// package includes): the -I dirs followed by the package roots
-/// (HCC_PATH/pkg, HCC_ROOT/std). Each is tried in turn; first match wins.
-/// Empty means angle-bracket includes cannot resolve.
+/// Ordered directories searched for angle-bracket #include <...>: the -I dirs
+/// then the package roots (HCC_ROOT/pkg, HCC_ROOT/std). First match wins. Empty
+/// means angle-bracket includes cannot resolve.
 include_path: []const []const u8 = &.{},
-/// Maps a dependency alias (from the project's hcc.toml) to a package path, so
-/// `#include <json/File.HC>` expands before resolution. A remote dependency
-/// maps to its import path (searched on include_path); a local (submodule)
-/// dependency maps to an absolute directory (resolved directly). Empty (no
-/// hcc.toml) leaves includes untouched.
-aliases: std.StringHashMapUnmanaged([]const u8) = .empty,
 includes: std.ArrayList(Frame) = .empty,
-/// The conditional-compilation nesting stack, innermost last. Empty means the
-/// top level, which always emits.
+/// Conditional-compilation nesting stack, innermost last. Empty is the top
+/// level, which always emits.
 conds: std.ArrayList(CondState) = .empty,
-/// Whether the prelude was injected; its files are then reserved (a user
-/// #include naming one is rejected: the prelude is implicit and always in
-/// scope).
-prelude_injected: bool = false,
-/// The append-only table of every source file seen, indexed by span.file;
-/// entry 0 is the base/top-level source. It never shrinks, so ids stay valid
-/// for the whole parse.
+/// Whether the core was injected; its files are then reserved (a user #include
+/// naming one is rejected, since the core is implicit and always in scope).
+core_injected: bool = false,
+/// Append-only table of every source file seen, indexed by span.file; entry 0
+/// is the base source. It never shrinks, so ids stay valid for the whole parse.
 files: std.ArrayList(source.FileInfo) = .empty,
 /// The driver-injected #exe executor, or null (the language server and tests
 /// leave it unset, so #exe reports it is unavailable rather than pulling the
 /// backend into the frontend module).
 exe_runner: ?ExeRunner = null,
 exe_ctx: *anyopaque = undefined,
-/// Counts spliced #exe outputs, so each generated frame gets a unique
-/// synthetic path for the cycle check.
+/// Counts spliced #exe outputs, so each generated frame gets a unique synthetic
+/// path for the cycle check.
 exe_gen: u32 = 0,
-/// A running hash of every source buffer consumed (base + prelude + every
-/// #include and #exe-spliced frame), for the driver's content-addressed build
-/// cache. Each buffer is length-prefixed so distinct file splits never collide.
+/// Running hash of every source buffer consumed (base + core + every #include
+/// and #exe-spliced frame), for the driver's content-addressed build cache.
+/// Each buffer is length-prefixed so distinct file splits never collide.
 src_hasher: std.crypto.hash.sha2.Sha256 = std.crypto.hash.sha2.Sha256.init(.{}),
 
 pub const Options = struct {
     /// Directory that relative #include "..." paths in the top-level source
-    /// resolve against; also fixes file 0's directory for privacy purposes.
+    /// resolve against; also fixes file 0's directory for privacy.
     base_dir: []const u8 = ".",
     /// Seeds the predefined target macros (_WIN32/__linux__/…).
     target: ?target_mod.Target = null,
     /// Extra compiler-predefined macros.
     defines: []const Define = &.{},
-    /// Injects the implicit prelude ahead of the base source, so its
-    /// definitions are in scope without an explicit #include.
-    inject_prelude: bool = true,
-    /// Ordered search path for angle-bracket #include <...> (library/package
-    /// includes): each directory is tried in turn, first match wins. Plain
-    /// "..." includes ignore this and resolve relative to the including file.
+    /// Injects the implicit core ahead of the base source, so its definitions
+    /// are in scope without an explicit #include.
+    inject_core: bool = true,
+    /// Ordered search path for angle-bracket #include <...>, tried in order,
+    /// first match wins. Plain "..." includes ignore this and resolve relative
+    /// to the including file.
     include_path: []const []const u8 = &.{},
-    /// Alias → import-path map from the project's hcc.toml. See the field of
-    /// the same name; empty means no alias expansion.
-    aliases: std.StringHashMapUnmanaged([]const u8) = .empty,
     /// The #exe compile-time executor and its opaque driver state. Null (the
     /// default) makes #exe report that it is unavailable.
     exe_runner: ?ExeRunner = null,
@@ -233,30 +231,28 @@ pub fn init(
         .inner = Lexer.init(arena, diags, src),
         .base_dir = opts.base_dir,
         .include_path = opts.include_path,
-        .aliases = opts.aliases,
         .exe_runner = opts.exe_runner,
         .exe_ctx = opts.exe_ctx,
     };
 
-    // File 0, the base/top-level source. Its privacy comes from base_dir; the
-    // source has no filename, so it gets directory-based privacy only.
-    // Canonicalised so its directory components line up with the canonical
-    // paths of #include'd files.
+    // File 0, the base source. Privacy comes from base_dir; it has no filename,
+    // so directory-based privacy only. Canonicalised so its directory components
+    // line up with the canonical paths of #include'd files.
     const canon = canonicalizeExisting(io, arena, opts.base_dir) catch opts.base_dir;
     try p.files.append(arena, .{ .dir = try dirComponents(arena, canon), .name = "" });
-    p.hashSource(src); // the base source is the first input to the build digest
+    p.hashSource(src); // first input to the build digest
 
     try p.addDefines(&.{.{ .name = "__HCC__", .value = "1" }});
     if (opts.target) |tgt| try p.addDefines(targetMacros(tgt));
     try p.addDefines(opts.defines);
 
-    if (opts.inject_prelude) try p.injectPrelude();
+    if (opts.inject_core) try p.injectCore();
     return p;
 }
 
 /// Seeds compiler-predefined object-like macros, each expanding to its integer
-/// value (or 1 for a non-numeric value). They are in effect from the first
-/// token; a program may #undef or redefine them.
+/// value (or 1 for a non-numeric value). In effect from the first token; a
+/// program may #undef or redefine them.
 fn addDefines(p: *Preprocessor, defs: []const Define) Error!void {
     for (defs) |d| {
         const n = std.fmt.parseInt(i64, d.value, 10) catch 1;
@@ -266,28 +262,35 @@ fn addDefines(p: *Preprocessor, defs: []const Define) Error!void {
     }
 }
 
-/// Pushes the embedded prelude as the first frame on the include stack, so its
-/// tokens come first; the prelude's own #includes resolve against the embedded
-/// table.
-fn injectPrelude(p: *Preprocessor) Error!void {
-    p.prelude_injected = true;
-    const file_id: u32 = @intCast(p.files.items.len);
-    try p.files.append(p.arena, try fileInfoForPath(p.arena, core.root));
-    p.hashSource(core.get(core.root).?);
-    var lexer = Lexer.init(p.arena, p.diags, core.get(core.root).?);
-    lexer.file = file_id;
-    try p.includes.append(p.arena, .{
-        .lexer = lexer,
-        .resume_toks = &.{},
-        .dir = posixDirname(core.root),
-        .path = try std.fmt.allocPrint(p.arena, "fs:{s}", .{core.root}),
-        .embedded = true,
-        .file_id = file_id,
-    });
+/// Pushes the embedded core as the first frame on the include stack, so its
+/// tokens come first; the core's #includes resolve against the embedded table.
+fn injectCore(p: *Preprocessor) Error!void {
+    p.core_injected = true;
+    // Push each core file as a source frame. The frame stack is LIFO, so to read
+    // them in boot order (core.files order, KConfig first) push in reverse. The
+    // first file then sits on top, above the base source.
+    var i: usize = core.files.len;
+    while (i > 0) {
+        i -= 1;
+        const f = core.files[i];
+        const file_id: u32 = @intCast(p.files.items.len);
+        try p.files.append(p.arena, try fileInfoForPath(p.arena, f.path));
+        p.hashSource(f.contents);
+        var lexer = Lexer.init(p.arena, p.diags, f.contents);
+        lexer.file = file_id;
+        try p.includes.append(p.arena, .{
+            .lexer = lexer,
+            .resume_toks = &.{},
+            .dir = posixDirname(f.path),
+            .path = try std.fmt.allocPrint(p.arena, "fs:{s}", .{f.path}),
+            .embedded = true,
+            .file_id = file_id,
+        });
+    }
 }
 
-/// Produces the next fully-expanded, directive-processed token. It is the only
-/// method the parser needs to pull tokens.
+/// The next fully-expanded, directive-processed token. The only method the
+/// parser needs to pull tokens.
 pub fn next(p: *Preprocessor) Error!Token {
     return p.nextExpanded();
 }
@@ -298,8 +301,8 @@ pub fn sourceFiles(p: *const Preprocessor) []const source.FileInfo {
     return p.files.items;
 }
 
-/// Folds one source buffer into the running content digest, length-prefixed so
-/// that a different split of the same bytes across files cannot collide.
+/// Folds one source buffer into the running content digest, length-prefixed so a
+/// different split of the same bytes across files cannot collide.
 fn hashSource(p: *Preprocessor, bytes: []const u8) void {
     var len: [8]u8 = undefined;
     std.mem.writeInt(u64, &len, bytes.len, .little);
@@ -307,8 +310,8 @@ fn hashSource(p: *Preprocessor, bytes: []const u8) void {
     p.src_hasher.update(bytes);
 }
 
-/// The digest of every source buffer consumed so far. Call after parsing, when
-/// all #includes and #exe splices have been read. Keys the build cache.
+/// Digest of every source buffer consumed so far. Call after parsing, when all
+/// #includes and #exe splices have been read. Keys the build cache.
 pub fn sourceDigest(p: *const Preprocessor) [32]u8 {
     var copy = p.src_hasher;
     var out: [32]u8 = undefined;
@@ -316,11 +319,23 @@ pub fn sourceDigest(p: *const Preprocessor) [32]u8 {
     return out;
 }
 
+/// Every macro currently defined, with its definition site, for go-to-definition
+/// on macro names. Read after parsing. #undef'd macros are absent;
+/// compiler-injected ones carry `predefined_macro_file`.
+pub fn macroDefs(p: *const Preprocessor, arena: std.mem.Allocator) Error![]const MacroDef {
+    const out = try arena.alloc(MacroDef, p.macros.count());
+    var it = p.macros.iterator();
+    var i: usize = 0;
+    while (it.next()) |e| : (i += 1)
+        out[i] = .{ .name = e.key_ptr.*, .def = e.value_ptr.def };
+    return out;
+}
+
 fn fail(p: *Preprocessor, file: u32, pos: source.Pos, comptime fmt: []const u8, args: anytype) Error {
     return p.diags.fail(.preproc, file, pos, fmt, args);
 }
 
-/// The file id diagnostics in the current innermost source should carry.
+/// The file id diagnostics in the innermost source should carry.
 fn currentFile(p: *const Preprocessor) u32 {
     if (p.includes.items.len > 0) {
         return p.includes.items[p.includes.items.len - 1].file_id;
@@ -328,9 +343,9 @@ fn currentFile(p: *const Preprocessor) u32 {
     return 0;
 }
 
-/// Pulls the next raw token, from the innermost open #include first, then the
-/// base source. Each frame stamps its file id onto the tokens it emits; the
-/// base source keeps file 0.
+/// The next raw token, from the innermost open #include first, then the base
+/// source. Each frame stamps its file id onto its tokens; the base source keeps
+/// file 0.
 fn innerNext(p: *Preprocessor) Error!Token {
     if (p.pushback.items.len > 0) return p.pushback.pop().?;
     if (p.lookahead) |t| {
@@ -349,8 +364,7 @@ fn innerNext(p: *Preprocessor) Error!Token {
 
 // ---- layer A: directives, no macro expansion ----
 
-/// Returns the next token, handling directives. Macro names come through
-/// unexpanded.
+/// The next token, handling directives. Macro names come through unexpanded.
 fn pull(p: *Preprocessor) Error!Token {
     while (true) {
         const t = try p.innerNext();
@@ -362,8 +376,8 @@ fn pull(p: *Preprocessor) Error!Token {
                 if (n > 0) {
                     try p.checkBalanced(n, t.span.file, t.span.pos);
                     const frame = p.includes.pop().?;
-                    // Replay the frame's resume tokens next, in order (they are
-                    // pushed reversed onto the LIFO pushback stack).
+                    // Replay the frame's resume tokens next, in order (pushed
+                    // reversed onto the LIFO pushback stack).
                     var i = frame.resume_toks.len;
                     while (i > 0) {
                         i -= 1;
@@ -408,14 +422,12 @@ fn directive(p: *Preprocessor, hash: Token) Error!void {
     if (toks.items.len == 0) return; // a lone `#`
 
     const name = directiveName(toks.items[0]) orelse "";
-    // Conditional-compilation directives are handled even inside a skipped
-    // region, so that #if … #endif nesting stays balanced; they are what
-    // decide what is skipped.
+    // Conditional directives are handled even inside a skipped region, to keep
+    // #if … #endif nesting balanced; they decide what is skipped.
     if (condDirective(name)) {
         return p.doConditional(name, toks.items, hash.span.file, hash.span.pos);
     }
-    // Every other directive takes effect only where the surrounding region is
-    // live.
+    // Every other directive takes effect only where the region is live.
     if (!p.emitting()) return;
     if (std.mem.eql(u8, name, "define")) return p.doDefine(toks.items);
     if (std.mem.eql(u8, name, "undef")) return p.doUndef(toks.items);
@@ -432,18 +444,18 @@ fn condDirective(name: []const u8) bool {
     return false;
 }
 
-/// Whether the current region's tokens and ordinary directives are live. False
-/// inside the unselected branch of a conditional. A group is only ever active
-/// when its parent was, so the innermost frame's flag is sufficient.
+/// Whether the current region is live. False inside an unselected conditional
+/// branch. A group is active only when its parent was, so the innermost frame's
+/// flag suffices.
 fn emitting(p: *const Preprocessor) bool {
     const n = p.conds.items.len;
     if (n > 0) return p.conds.items[n - 1].active;
     return true;
 }
 
-/// Reports an error if a conditional opened in the file at include
-/// depth >= depth is still open, i.e. the file ended without its #endif. depth
-/// is includes.items.len for a popping frame, or 0 at the base source's end.
+/// Errors if a conditional opened at include depth >= depth is still open, i.e.
+/// the file ended without its #endif. depth is includes.items.len for a popping
+/// frame, or 0 at the base source's end.
 fn checkBalanced(p: *Preprocessor, depth: usize, file: u32, pos: source.Pos) Error!void {
     const n = p.conds.items.len;
     if (n > 0 and p.conds.items[n - 1].frame_depth >= depth) {
@@ -460,10 +472,9 @@ fn doConditional(p: *Preprocessor, name: []const u8, toks: []const Token, file: 
     return p.pushCond(name, toks, file, pos);
 }
 
-/// Opens a new conditional group for #if/#ifdef/#ifndef. The controlling
-/// expression is evaluated only when the enclosing region is live; inside an
-/// already skipped region the directive only balances nesting and never errors
-/// on its operand.
+/// Opens a conditional group for #if/#ifdef/#ifndef. The controlling expression
+/// is evaluated only when the enclosing region is live; inside a skipped region
+/// the directive only balances nesting and never errors on its operand.
 fn pushCond(p: *Preprocessor, name: []const u8, toks: []const Token, file: u32, pos: source.Pos) Error!void {
     const parent_active = p.emitting();
     var cond = false;
@@ -478,7 +489,7 @@ fn pushCond(p: *Preprocessor, name: []const u8, toks: []const Token, file: u32, 
     });
 }
 
-/// Evaluates the controlling condition of #if/#ifdef/#ifndef.
+/// Evaluates the condition of #if/#ifdef/#ifndef.
 fn evalCondDirective(p: *Preprocessor, name: []const u8, toks: []const Token, file: u32, pos: source.Pos) Error!bool {
     if (std.mem.eql(u8, name, "ifdef") or std.mem.eql(u8, name, "ifndef")) {
         const mac = try p.ifdefName(name, toks, file, pos);
@@ -532,12 +543,11 @@ fn doEndif(p: *Preprocessor, file: u32, pos: source.Pos) Error!void {
     _ = p.conds.pop();
 }
 
-/// Evaluates the controlling expression of #if/#elif and reports whether it is
-/// non-zero. It follows C's #if rules adapted to HolyC: `defined NAME` /
-/// `defined(NAME)` is resolved against the macro table first (so the operand
-/// is never expanded), the rest is object-like macro-expanded, any identifier
-/// still surviving is taken as 0, and the result is evaluated as an integer
-/// constant expression in HolyC precedence.
+/// Evaluates the #if/#elif expression and reports whether it is non-zero.
+/// Follows C's #if rules adapted to HolyC: `defined NAME` / `defined(NAME)` is
+/// resolved against the macro table first (so the operand is never expanded),
+/// the rest is macro-expanded, any surviving identifier is taken as 0, and the
+/// result is an integer constant expression in HolyC precedence.
 fn evalIf(p: *Preprocessor, toks: []const Token, file: u32, pos: source.Pos) Error!bool {
     if (toks.len == 0) return p.fail(file, pos, "#if has no expression", .{});
     const resolved = try p.resolveDefined(toks, file, pos);
@@ -576,8 +586,8 @@ fn resolveDefined(p: *Preprocessor, toks: []const Token, file: u32, pos: source.
     return out.items;
 }
 
-/// Parses the operand of `defined`, either `NAME` or `(NAME)`, starting at
-/// index i. Returns the name and the index of its last consumed token.
+/// Parses the operand of `defined`, `NAME` or `(NAME)`, starting at index i.
+/// Returns the name and the index of its last consumed token.
 fn definedOperand(p: *Preprocessor, toks: []const Token, i: usize, file: u32, pos: source.Pos) Error!struct { []const u8, usize } {
     if (i >= toks.len) {
         return p.fail(file, pos, "`defined` is missing a macro name", .{});
@@ -594,9 +604,9 @@ fn definedOperand(p: *Preprocessor, toks: []const Token, i: usize, file: u32, po
     }
 }
 
-/// Fully macro-expands a standalone token slice (object-like and function-like)
-/// for #if/#elif expressions, reusing the argument expander. Surviving
-/// identifiers are left for the evaluator to read as 0.
+/// Fully macro-expands a standalone token slice for #if/#elif expressions,
+/// reusing the argument expander. Surviving identifiers are left for the
+/// evaluator to read as 0.
 fn expandSlice(p: *Preprocessor, toks: []const Token) Error![]const Token {
     const pps = try p.expandArg(try p.toPp(toks, null));
     const out = try p.arena.alloc(Token, pps.len);
@@ -604,10 +614,9 @@ fn expandSlice(p: *Preprocessor, toks: []const Token) Error![]const Token {
     return out;
 }
 
-/// A recursive-descent evaluator for a preprocessor #if integer constant
-/// expression. It walks an already-expanded token slice using HolyC's operator
-/// precedence (mirroring the language's infix table); a name that reaches it
-/// is an undefined macro and reads as 0.
+/// Recursive-descent evaluator for a preprocessor #if integer constant
+/// expression. Walks an already-expanded token slice in HolyC operator
+/// precedence; a name that reaches it is an undefined macro and reads as 0.
 const CondEval = struct {
     p: *Preprocessor,
     toks: []const Token,
@@ -625,8 +634,8 @@ const CondEval = struct {
         return v;
     }
 
-    /// Precedence climbing: parses a unary operand then folds in any infix
-    /// operator whose binding power is at least min_bp. All #if operators are
+    /// Precedence climbing: parse a unary operand, then fold in any infix
+    /// operator with binding power >= min_bp. All #if operators are
     /// left-associative, so the right operand is parsed at bp+1.
     fn expr(e: *CondEval, min_bp: u8) Error!i64 {
         var lhs = try e.unary();
@@ -687,8 +696,8 @@ const CondEval = struct {
                 return v;
             },
             .ident, .keyword => {
-                // A name (or type/keyword) that survived expansion is not a
-                // defined macro, so per C #if rules it reads as 0.
+                // A name/keyword that survived expansion is not a defined macro,
+                // so per C #if rules it reads as 0.
                 e.i += 1;
                 return 0;
             },
@@ -697,10 +706,10 @@ const CondEval = struct {
         }
     }
 
-    /// Applies an integer #if binary operator. Logical/relational results are
-    /// 0 or 1; division or modulo by zero is an error (the expression is not
-    /// short-circuited). Arithmetic wraps and out-of-range shift counts are
-    /// defined (0 / sign-fill), matching the reference implementation.
+    /// Applies an integer #if binary operator. Logical/relational results are 0
+    /// or 1; division or modulo by zero is an error (no short-circuiting).
+    /// Arithmetic wraps; out-of-range shift counts give 0 / sign-fill, matching
+    /// the reference implementation.
     fn applyBinop(e: *CondEval, op_tok: Token, a: i64, b: i64) Error!i64 {
         return switch (op_tok.kind) {
             .star => a *% b,
@@ -737,8 +746,8 @@ const CondEval = struct {
     }
 };
 
-/// The binding power of an infix operator valid in an #if integer expression,
-/// mirroring the language's infix table (higher binds tighter).
+/// Binding power of an infix operator valid in an #if expression, mirroring the
+/// language's infix table (higher binds tighter).
 fn condInfixBp(k: Token.Kind) ?u8 {
     return switch (k) {
         .or_or => 1,
@@ -781,9 +790,8 @@ fn doDefine(p: *Preprocessor, toks: []const Token) Error!void {
         else => return p.fail(toks[1].span.file, toks[1].span.pos, "macro name must be an identifier", .{}),
     };
     // Function-like macro iff a `(` directly abuts the name with no whitespace
-    // (the C rule that distinguishes `#define F(x) …` from `#define F (x) …`).
-    // Adjacency is read from the spans: same file, `(` starting where the name
-    // ended.
+    // (the C rule distinguishing `#define F(x) …` from `#define F (x) …`).
+    // Adjacency is read from the spans: same file, `(` starts where name ended.
     if (toks.len >= 3 and toks[2].kind == .l_paren and
         toks[2].span.file == toks[1].span.file and toks[2].span.start == toks[1].span.end)
     {
@@ -815,11 +823,12 @@ fn doDefine(p: *Preprocessor, toks: []const Token) Error!void {
             .params = params.items,
             .variadic = variadic,
             .body = try p.arena.dupe(Token, toks[i..]),
+            .def = toks[1].span,
         });
         return;
     }
     // Object-like: everything after the name is the replacement body.
-    try p.macros.put(p.arena, name, .{ .body = try p.arena.dupe(Token, toks[2..]) });
+    try p.macros.put(p.arena, name, .{ .body = try p.arena.dupe(Token, toks[2..]), .def = toks[1].span });
 }
 
 fn doUndef(p: *Preprocessor, toks: []const Token) Error!void {
@@ -829,16 +838,16 @@ fn doUndef(p: *Preprocessor, toks: []const Token) Error!void {
     _ = p.macros.swapRemove(toks[1].kind.ident);
 }
 
-/// Resolves and opens an include directive: read the file and push it onto the
-/// source stack so its tokens stream in next. A plain "path" resolves relative
-/// to the including file's directory; a "::"-prefixed path searches the
-/// current directory and each ancestor (TempleOS upward search). Cycles and
-/// excessive nesting are rejected.
+/// Resolves and opens an include: read the file and push it onto the source
+/// stack so its tokens stream in next. A plain "path" resolves relative to the
+/// including file's directory; a "::"-prefixed path searches the current
+/// directory and each ancestor (TempleOS upward search). Cycles and excessive
+/// nesting are rejected.
 fn doInclude(p: *Preprocessor, toks: []const Token) Error!void {
     const file = toks[0].span.file;
     const pos = toks[0].span.pos;
-    // Angle-bracket form #include <path>: a library/package include resolved
-    // against the include path, never relative to the including file.
+    // Angle-bracket #include <path>: resolved against the include path, never
+    // relative to the including file.
     if (toks.len >= 2 and toks[1].kind == .lt) {
         return p.doIncludeAngle(toks, file, pos);
     }
@@ -857,21 +866,21 @@ fn doInclude(p: *Preprocessor, toks: []const Token) Error!void {
         var suffix = path_str[2..];
         suffix = std.mem.trimStart(u8, suffix, "/");
         if (!embedded) {
-            if (p.reservedPrelude(suffix)) |name| {
-                return p.reservedPreludeErr(name, file, pos);
+            if (p.reservedCore(suffix)) |name| {
+                return p.reservedCoreErr(name, file, pos);
             }
         }
         return p.includeUpward(suffix, cur_dir, embedded, path_str, file, pos);
     }
     if (embedded) {
-        // The prelude (and anything it #includes) lives in the embedded table;
-        // resolve there with forward-slash paths, never touching the disk.
+        // The core (and anything it #includes) lives in the embedded table;
+        // resolve there with forward-slash paths, never touching disk.
         const joined = try posixJoinClean(p.arena, cur_dir, path_str);
         return p.openIncludeEmbedded(joined, path_str, file, pos);
     }
-    // User (disk) #include: a path naming a prelude file is reserved.
-    if (p.reservedPrelude(path_str)) |name| {
-        return p.reservedPreludeErr(name, file, pos);
+    // User (disk) #include: a path naming a core file is reserved.
+    if (p.reservedCore(path_str)) |name| {
+        return p.reservedCoreErr(name, file, pos);
     }
     const joined = try std.fs.path.join(p.arena, &.{ cur_dir, path_str });
     const canon = canonicalizeExisting(p.io, p.arena, joined) catch |e| switch (e) {
@@ -881,13 +890,11 @@ fn doInclude(p: *Preprocessor, toks: []const Token) Error!void {
     return p.openInclude(canon, path_str, file, pos, try fileInfoForDisk(p.arena, canon));
 }
 
-/// Resolves an angle-bracket #include <path> against the include path. The
-/// lexer has no directive context, so <path> arrives as `lt … gt` operator
-/// tokens rather than a string; the path is recovered from the raw source
-/// between the brackets (whitespace-insensitive, exact). Each include-path
-/// directory is tried in order; the first that resolves wins. Unlike "...",
-/// this never searches relative to the including file — library and package
-/// names live only on the include path.
+/// Resolves an angle-bracket #include <path> against the include path. The lexer
+/// has no directive context, so <path> arrives as `lt … gt` operator tokens
+/// rather than a string; the path is recovered from the raw source between the
+/// brackets. Each include-path directory is tried in order, first match wins.
+/// Unlike "...", this never searches relative to the including file.
 fn doIncludeAngle(p: *Preprocessor, toks: []const Token, file: u32, pos: source.Pos) Error!void {
     var gt_idx: ?usize = null;
     for (toks[2..], 2..) |t, i| {
@@ -898,28 +905,16 @@ fn doIncludeAngle(p: *Preprocessor, toks: []const Token, file: u32, pos: source.
     }
     const gt = gt_idx orelse
         return p.fail(file, pos, "unterminated #include <...>: missing '>'", .{});
-    // The header name is the raw text between '<' and '>' in the file the
-    // directive is in. All directive-line tokens share that file, so the
-    // innermost frame's (or base) source is the right buffer to slice.
+    // The header name is the raw text between '<' and '>' in the directive's
+    // file. All directive-line tokens share that file, so the innermost frame's
+    // (or base) source is the buffer to slice.
     const src = p.currentSource();
     const name = std.mem.trim(u8, src[toks[1].span.end..toks[gt].span.start], " \t");
     if (name.len == 0) return p.fail(file, pos, "#include <> has an empty path", .{});
-    // A dependency alias (from hcc.toml) expands to its full import path before
-    // resolution; a bare `<Str.HC>` has no leading segment to match and falls
-    // through to the stdlib path unchanged.
-    const resolved = try p.expandAlias(name);
-    // A prelude file is implicit and always in scope, angle brackets or not.
-    if (p.reservedPrelude(resolved)) |pn| return p.reservedPreludeErr(pn, file, pos);
-    // A local (submodule) alias expands to an absolute directory, so it resolves
-    // straight to a file rather than being searched on the pkg/std path.
-    if (std.fs.path.isAbsolute(resolved)) {
-        if (canonicalizeExisting(p.io, p.arena, resolved)) |canon| {
-            return p.openInclude(canon, name, file, pos, try fileInfoForDisk(p.arena, canon));
-        } else |e| if (e == error.OutOfMemory) return error.OutOfMemory;
-        return p.fail(file, pos, "cannot find #include <{s}> (local dependency {s})", .{ name, resolved });
-    }
+    // A core file is implicit and always in scope, angle brackets or not.
+    if (p.reservedCore(name)) |pn| return p.reservedCoreErr(pn, file, pos);
     for (p.include_path) |root| {
-        const joined = try std.fs.path.join(p.arena, &.{ root, resolved });
+        const joined = try std.fs.path.join(p.arena, &.{ root, name });
         if (canonicalizeExisting(p.io, p.arena, joined)) |canon| {
             return p.openInclude(canon, name, file, pos, try fileInfoForDisk(p.arena, canon));
         } else |e| if (e == error.OutOfMemory) return error.OutOfMemory;
@@ -927,44 +922,32 @@ fn doIncludeAngle(p: *Preprocessor, toks: []const Token, file: u32, pos: source.
     return p.fail(file, pos, "cannot find #include <{s}> on the include path", .{name});
 }
 
-/// Expands a leading dependency alias in an angle-include path to its full
-/// import path: `json/Json.HC` → `github.com/terry/json/Json.HC` when hcc.toml
-/// maps `json`. Only the first path segment is matched; a single-segment name
-/// (no `/`) or an unknown segment is returned unchanged, so stdlib and
-/// full-path includes are unaffected.
-fn expandAlias(p: *Preprocessor, name: []const u8) Error![]const u8 {
-    if (p.aliases.count() == 0) return name;
-    const slash = std.mem.indexOfScalar(u8, name, '/') orelse return name;
-    const full = p.aliases.get(name[0..slash]) orelse return name;
-    return std.fmt.allocPrint(p.arena, "{s}{s}", .{ full, name[slash..] });
-}
-
-/// The source buffer of the file currently being read (the innermost include
-/// frame, or the base source at the top level). Recovers raw text the token
-/// stream doesn't preserve, e.g. an angle-bracket header name.
+/// The source buffer of the file currently being read (innermost include frame,
+/// or base source at the top level). Recovers raw text the token stream doesn't
+/// preserve, e.g. an angle-bracket header name.
 fn currentSource(p: *Preprocessor) []const u8 {
     const n = p.includes.items.len;
     if (n > 0) return p.includes.items[n - 1].lexer.src;
     return p.inner.src;
 }
 
-/// Handles an #exe compile-time block: `#exe { …HolyC… }`. The block is
-/// compiled and run at compile time (via the driver-injected executor); its
-/// stdout is spliced back in as source exactly where the directive stood, so it
-/// can generate declarations or tables. The block sees the current file's
-/// preceding text (its own functions and types are in scope) and the implicit
-/// prelude; its body runs as top-level statements.
+/// Handles an #exe compile-time block: `#exe { …HolyC… }`. The block runs at
+/// compile time (via the driver-injected executor); its stdout is spliced back
+/// in as source where the directive stood, so it can generate declarations or
+/// tables. The block sees the current file's preceding text (its own functions
+/// and types are in scope) and the implicit core; its body runs as top-level
+/// statements.
 ///
 /// The lexer has no directive context, so the body arrives as ordinary tokens.
-/// The block is delimited by matching braces, and the raw body text is
-/// recovered from the source between the opening '{' and its matching '}'.
+/// The block is delimited by matching braces, and the raw body text is recovered
+/// from the source between the opening '{' and its matching '}'.
 fn doExe(p: *Preprocessor, toks: []const Token, hash: Token) Error!void {
     const file = toks[0].span.file;
     const pos = toks[0].span.pos;
 
     // Scan for the opening '{' and its matching '}'. Tokens come from the
-    // collected directive-line tokens first (index 1 skips the "exe" name),
-    // then the live stream, which may span many lines.
+    // collected directive-line tokens first (index 1 skips the "exe" name), then
+    // the live stream, which may span many lines.
     var ti: usize = 1;
     const open = try p.nextExeTok(toks, &ti);
     if (open.kind != .l_brace)
@@ -987,18 +970,18 @@ fn doExe(p: *Preprocessor, toks: []const Token, hash: Token) Error!void {
         }
     }
 
-    // The body and the file text preceding the directive both live in the
-    // buffer currently being read. All the scanned tokens share it, so the
-    // brace spans index into it directly.
+    // The body and the file text preceding the directive both live in the buffer
+    // currently being read. All scanned tokens share it, so the brace spans
+    // index into it directly.
     const src = p.currentSource();
     const body = src[open.span.end..close.span.start];
     const prefix = src[0..hash.span.start];
     const leftover = toks[ti..]; // any same-line tokens after '}'
 
-    // With no executor (the language server and tests supply none, so the
-    // backend stays out of the frontend module), the block cannot run: skip it
-    // silently rather than erroring, so an #exe file still analyzes in the
-    // editor. Any same-line tokens after '}' still resume in order.
+    // With no executor (the language server and tests supply none, keeping the
+    // backend out of the frontend module) the block cannot run: skip it silently
+    // rather than erroring, so an #exe file still analyzes in the editor.
+    // Same-line tokens after '}' still resume in order.
     const runner = p.exe_runner orelse {
         var i = leftover.len;
         while (i > 0) {
@@ -1008,8 +991,8 @@ fn doExe(p: *Preprocessor, toks: []const Token, hash: Token) Error!void {
         return;
     };
 
-    // The compile-time unit: the file up to the directive (so the block can
-    // call functions and reference types declared earlier), then the body as
+    // The compile-time unit: the file up to the directive (so the block can call
+    // functions and reference types declared earlier), then the body as
     // top-level statements. Its stdout becomes the spliced source.
     const unit = try std.fmt.allocPrint(p.arena, "{s}\n{s}\n", .{ prefix, body });
 
@@ -1033,7 +1016,7 @@ fn doExe(p: *Preprocessor, toks: []const Token, hash: Token) Error!void {
     }
 }
 
-/// The next token of an #exe block scan: the collected directive-line tokens
+/// The next token of an #exe block scan: collected directive-line tokens
 /// (toks[ti..]) first, then the live inner stream.
 fn nextExeTok(p: *Preprocessor, toks: []const Token, ti: *usize) Error!Token {
     if (ti.* < toks.len) {
@@ -1073,25 +1056,25 @@ fn includeUpward(p: *Preprocessor, suffix: []const u8, cur_dir: []const u8, embe
     return p.fail(file, pos, "cannot find #include \"{s}\" by upward search", .{display});
 }
 
-/// Whether a user (disk) #include path names a file in the injected prelude,
-/// returning the cleaned name. Prelude files are implicit and always in scope,
-/// so a program must not #include them directly.
-fn reservedPrelude(p: *Preprocessor, path_str: []const u8) ?[]const u8 {
-    if (!p.prelude_injected) return null;
+/// Whether a user (disk) #include path names a file in the injected core,
+/// returning the cleaned name. Core files are implicit and always in scope, so a
+/// program must not #include them directly.
+fn reservedCore(p: *Preprocessor, path_str: []const u8) ?[]const u8 {
+    if (!p.core_injected) return null;
     const clean = posixClean(p.arena, path_str) catch return null;
     if (clean.len == 0 or std.mem.eql(u8, clean, ".")) return null;
     if (core.exists(clean)) return clean;
     return null;
 }
 
-/// The diagnostic for a program that tries to #include a prelude file directly.
-fn reservedPreludeErr(p: *Preprocessor, name: []const u8, file: u32, pos: source.Pos) Error {
-    return p.fail(file, pos, "cannot #include \"{s}\": it is part of the implicit prelude and is always in scope", .{name});
+/// Diagnostic for a program that tries to #include a core file directly.
+fn reservedCoreErr(p: *Preprocessor, name: []const u8, file: u32, pos: source.Pos) Error {
+    return p.fail(file, pos, "cannot #include \"{s}\": it is part of the implicit core and is always in scope", .{name});
 }
 
-/// Reads an already-resolved canonical include path from disk and pushes it
-/// onto the source stack, after the cycle and depth checks. display is the
-/// original spelling, used in error messages.
+/// Reads an already-resolved canonical include path from disk and pushes it onto
+/// the source stack, after the cycle and depth checks. display is the original
+/// spelling, used in error messages.
 fn openInclude(p: *Preprocessor, canon: []const u8, display: []const u8, file: u32, pos: source.Pos, info: source.FileInfo) Error!void {
     const contents = std.Io.Dir.cwd().readFileAlloc(p.io, canon, p.arena, .limited(64 << 20)) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -1101,9 +1084,9 @@ fn openInclude(p: *Preprocessor, canon: []const u8, display: []const u8, file: u
     return p.pushFrame(canon, dir, contents, display, file, pos, info, false, &.{});
 }
 
-/// Reads an include resolved within the embedded prelude table and pushes it
-/// onto the source stack. fs_path is the cleaned forward-slash path, which the
-/// new frame inherits for its own relative #includes.
+/// Reads an include resolved within the embedded core table and pushes it onto
+/// the source stack. fs_path is the cleaned forward-slash path, which the new
+/// frame inherits for its own relative #includes.
 fn openIncludeEmbedded(p: *Preprocessor, fs_path: []const u8, display: []const u8, file: u32, pos: source.Pos) Error!void {
     const contents = core.get(fs_path) orelse
         return p.fail(file, pos, "cannot read #include \"{s}\": FileNotFound", .{display});
@@ -1111,12 +1094,11 @@ fn openIncludeEmbedded(p: *Preprocessor, fs_path: []const u8, display: []const u
     return p.pushFrame(key, posixDirname(fs_path), contents, display, file, pos, try fileInfoForPath(p.arena, fs_path), true, &.{});
 }
 
-/// Pushes an include (or #exe-generated) source onto the source stack, after
-/// the cycle and depth checks. path identifies the frame for the cycle check;
-/// dir is the base for that file's relative includes. extra_resume tokens (the
-/// same-line leftovers after an #exe block; empty for a plain #include) replay
-/// first when the frame is exhausted, ahead of the token parked past the
-/// directive line.
+/// Pushes an include (or #exe-generated) source onto the source stack, after the
+/// cycle and depth checks. path identifies the frame for the cycle check; dir is
+/// the base for that file's relative includes. extra_resume tokens (same-line
+/// leftovers after an #exe block; empty for a plain #include) replay first when
+/// the frame is exhausted, ahead of the token parked past the directive line.
 fn pushFrame(p: *Preprocessor, path: []const u8, dir: []const u8, contents: []const u8, display: []const u8, file: u32, pos: source.Pos, info: source.FileInfo, embedded: bool, extra_resume: []const Token) Error!void {
     for (p.includes.items) |f| {
         if (std.mem.eql(u8, f.path, path)) {
@@ -1126,16 +1108,15 @@ fn pushFrame(p: *Preprocessor, path: []const u8, dir: []const u8, contents: []co
     if (p.includes.items.len >= max_include_depth) {
         return p.fail(file, pos, "#include nested too deeply", .{});
     }
-    // Resume tokens replayed once the frame is exhausted: the extra_resume
-    // leftovers first, then the single token already read past the directive
-    // line.
+    // Resume tokens replayed once the frame is exhausted: extra_resume leftovers
+    // first, then the token already read past the directive line.
     var resume_list: std.ArrayList(Token) = .empty;
     try resume_list.appendSlice(p.arena, extra_resume);
     if (p.lookahead) |t| try resume_list.append(p.arena, t);
     p.lookahead = null;
     p.hashSource(contents); // every included / #exe-spliced buffer feeds the digest
-    // Register this file; its id is stamped onto the frame's tokens and the
-    // table never shrinks, so ids stay valid for the whole parse.
+    // Register this file; its id is stamped onto the frame's tokens and the table
+    // never shrinks, so ids stay valid for the whole parse.
     const file_id: u32 = @intCast(p.files.items.len);
     try p.files.append(p.arena, info);
     var lexer = Lexer.init(p.arena, p.diags, contents);
@@ -1166,7 +1147,7 @@ fn take(p: *Preprocessor) Error!PpTok {
 
 /// The fully-expanded next token. Object-like macros prepend their body for
 /// rescan; a function-like macro expands only when its name is immediately
-/// followed by `(`, otherwise the name is left as an ordinary identifier.
+/// followed by `(`, else the name is left as an ordinary identifier.
 fn nextExpanded(p: *Preprocessor) Error!Token {
     while (true) {
         const pt = try p.take();
@@ -1197,18 +1178,18 @@ fn nextExpanded(p: *Preprocessor) Error!Token {
     }
 }
 
-/// Wraps plain body tokens as PpToks carrying a base hide set (for object-like
-/// bodies, whose tokens have no per-token hide of their own).
+/// Wraps plain body tokens as PpToks carrying a base hide set (object-like
+/// bodies have no per-token hide of their own).
 fn toPp(p: *Preprocessor, body: []const Token, hide: ?*const HideSet) Error![]const PpTok {
     const out = try p.arena.alloc(PpTok, body.len);
     for (body, 0..) |t, i| out[i] = .{ .tok = t, .hide = hide };
     return out;
 }
 
-/// Pushes an expansion onto the front of a queue (nearest LAST), adding `mac`
-/// to each token's hide set so `mac` is not re-expanded within its own
-/// expansion. Each token keeps whatever hide it already carried (e.g. from
-/// argument pre-expansion), so nested expansions stay correctly guarded.
+/// Pushes an expansion onto the front of a queue (nearest LAST), adding `mac` to
+/// each token's hide set so `mac` is not re-expanded within its own expansion.
+/// Each token keeps whatever hide it already carried (e.g. from argument
+/// pre-expansion), so nested expansions stay guarded.
 fn pushExpansion(p: *Preprocessor, queue: *std.ArrayList(PpTok), exp: []const PpTok, mac: []const u8) Error!void {
     try queue.ensureUnusedCapacity(p.arena, exp.len);
     var i = exp.len;
@@ -1236,15 +1217,15 @@ fn isVaArgs(m: Macro, tok: Token) bool {
 }
 
 /// Whether body[i], body[i+1] form the `##` paste operator: two `#` tokens with
-/// no space between them (so a stray `# #` is not mistaken for a paste).
+/// no space between them (so a stray `# #` is not read as a paste).
 fn isPasteOp(body: []const Token, i: usize) bool {
     return i + 1 < body.len and body[i].kind == .hash and body[i + 1].kind == .hash and
         body[i].span.file == body[i + 1].span.file and body[i].span.end == body[i + 1].span.start;
 }
 
 /// Collects a function-like macro's arguments from the main token stream, the
-/// opening `(` already consumed, up to the matching `)`. Arguments are split on
-/// top-level commas; commas inside nested parentheses stay within an argument.
+/// opening `(` already consumed, up to the matching `)`. Split on top-level
+/// commas; commas inside nested parentheses stay within an argument.
 fn collectArgsStream(p: *Preprocessor) Error![]const []const PpTok {
     var args: std.ArrayList([]const PpTok) = .empty;
     var cur: std.ArrayList(PpTok) = .empty;
@@ -1314,7 +1295,7 @@ fn collectArgsStack(p: *Preprocessor, work: *std.ArrayList(PpTok)) Error![]const
 }
 
 /// Validates argument arity and normalizes the `F()` case (a single empty
-/// argument when one is expected). Returns the possibly-adjusted arg list.
+/// argument when one is expected). Returns the adjusted arg list.
 fn checkArgs(p: *Preprocessor, m: Macro, args: []const []const PpTok, name_tok: Token) Error![]const []const PpTok {
     const named = m.params.?.len;
     var a = args;
@@ -1332,8 +1313,8 @@ fn checkArgs(p: *Preprocessor, m: Macro, args: []const []const PpTok, name_tok: 
     return a;
 }
 
-/// The variadic arguments (those past the named parameters) rejoined with the
-/// commas that separated them, for `__VA_ARGS__`.
+/// The variadic arguments (those past the named parameters) rejoined with their
+/// separating commas, for `__VA_ARGS__`.
 fn vaRaw(p: *Preprocessor, m: Macro, args: []const []const PpTok) Error![]const PpTok {
     var out: std.ArrayList(PpTok) = .empty;
     var idx = m.params.?.len;
@@ -1346,10 +1327,10 @@ fn vaRaw(p: *Preprocessor, m: Macro, args: []const []const PpTok) Error![]const 
     return out.items;
 }
 
-/// Fully expands a token sequence in isolation, used to pre-expand a macro
-/// argument before it is substituted into positions not adjacent to `#`/`##`
-/// (the C rule that makes nested calls and the STR/XSTR idiom work). A
-/// function-like macro whose `(` lies outside the sequence is left unexpanded.
+/// Fully expands a token sequence in isolation, to pre-expand a macro argument
+/// before it is substituted into positions not adjacent to `#`/`##` (the C rule
+/// that makes nested calls and the STR/XSTR idiom work). A function-like macro
+/// whose `(` lies outside the sequence is left unexpanded.
 fn expandArg(p: *Preprocessor, input: []const PpTok) Error![]const PpTok {
     var out: std.ArrayList(PpTok) = .empty;
     var work: std.ArrayList(PpTok) = .empty;
@@ -1382,8 +1363,8 @@ fn expandArg(p: *Preprocessor, input: []const PpTok) Error![]const PpTok {
     return out.items;
 }
 
-/// A stringized form of an argument: the tokens' spellings joined by single
-/// spaces. Stored as the (already-decoded) value of a string token.
+/// A stringized argument: the tokens' spellings joined by single spaces. Stored
+/// as the (already-decoded) value of a string token.
 fn stringize(p: *Preprocessor, arg: []const PpTok) Error![]const u8 {
     var buf: std.ArrayList(u8) = .empty;
     for (arg, 0..) |a, idx| {
@@ -1393,7 +1374,7 @@ fn stringize(p: *Preprocessor, arg: []const PpTok) Error![]const u8 {
     return buf.items;
 }
 
-/// The source spelling of a token, for `#` stringize and `##` paste.
+/// Source spelling of a token, for `#` stringize and `##` paste.
 fn spell(p: *Preprocessor, t: Token) Error![]const u8 {
     return switch (t.kind) {
         .ident => |s| s,
@@ -1407,7 +1388,7 @@ fn spell(p: *Preprocessor, t: Token) Error![]const u8 {
 }
 
 /// Pastes two tokens by concatenating their spellings and re-lexing; null if
-/// that yields nothing.
+/// that yields no token.
 fn paste(p: *Preprocessor, a: Token, b: Token) Error!?Token {
     const text = try std.fmt.allocPrint(p.arena, "{s}{s}", .{ try p.spell(a), try p.spell(b) });
     if (text.len == 0) return null;
@@ -1418,9 +1399,9 @@ fn paste(p: *Preprocessor, a: Token, b: Token) Error!?Token {
 }
 
 /// Produces a function-like macro's expansion for a call, given the collected
-/// (raw) arguments. Parameters in ordinary positions are pre-expanded;
-/// parameters that are operands of `#` or `##` use their raw form. `base_hide`
-/// is the hide set of the invoking name, applied to body-origin tokens.
+/// (raw) arguments. Parameters in ordinary positions are pre-expanded; operands
+/// of `#` or `##` use their raw form. `base_hide` is the invoking name's hide
+/// set, applied to body-origin tokens.
 fn substitute(p: *Preprocessor, m: Macro, args: []const []const PpTok, base_hide: ?*const HideSet) Error![]const PpTok {
     var out: std.ArrayList(PpTok) = .empty;
     const body = m.body;
@@ -1431,7 +1412,7 @@ fn substitute(p: *Preprocessor, m: Macro, args: []const []const PpTok, base_hide
         if (isPasteOp(body, i)) {
             const ri = i + 2;
             // GNU comma elision: `, ## __VA_ARGS__` drops the comma when the
-            // variadic arguments are empty, and otherwise just appends them.
+            // variadic arguments are empty, else appends them.
             if (ri < body.len and isVaArgs(m, body[ri])) {
                 const va = try p.vaRaw(m, args);
                 if (va.len == 0) {
@@ -1479,8 +1460,8 @@ fn substitute(p: *Preprocessor, m: Macro, args: []const []const PpTok, base_hide
                 continue;
             }
         }
-        // A parameter (not consumed as a `##` right operand above): raw when it
-        // is the left operand of a following `##`, else pre-expanded.
+        // A parameter (not consumed as a `##` right operand above): raw when the
+        // left operand of a following `##`, else pre-expanded.
         if (paramIndex(m, body[i])) |pi| {
             if (isPasteOp(body, i + 1)) {
                 for (args[pi]) |a| try out.append(p.arena, .{ .tok = a.tok, .hide = base_hide });
@@ -1509,8 +1490,8 @@ fn substitute(p: *Preprocessor, m: Macro, args: []const []const PpTok, base_hide
 // ---- free helpers ----
 
 /// The directive keyword after `#`, or null if tok is not a directive name.
-/// Most directive names lex as identifiers; `if` and `else` are keywords, so
-/// they are mapped back here.
+/// Most directive names lex as identifiers; `if` and `else` are keywords, mapped
+/// back here.
 fn directiveName(tok: Token) ?[]const u8 {
     switch (tok.kind) {
         .ident => |s| return s,
@@ -1529,8 +1510,8 @@ fn canonicalizeExisting(io: std.Io, arena: std.mem.Allocator, path: []const u8) 
     return std.Io.Dir.cwd().realPathFileAlloc(io, path, arena);
 }
 
-/// The meaningful path components of a directory (skipping the root, `.`, and
-/// `..`), giving each source file a directory for `_`-privacy.
+/// The meaningful path components of a directory (skipping root, `.`, `..`),
+/// giving each source file a directory for `_`-privacy.
 fn dirComponents(arena: std.mem.Allocator, dir: []const u8) Error![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     var it = std.mem.splitScalar(u8, dir, std.fs.path.sep);
@@ -1541,8 +1522,7 @@ fn dirComponents(arena: std.mem.Allocator, dir: []const u8) Error![]const []cons
     return out.items;
 }
 
-/// The FileInfo of a file on disk, from its parent directory and its own
-/// filename.
+/// The FileInfo of a file on disk, from its parent directory and filename.
 fn fileInfoForDisk(arena: std.mem.Allocator, path: []const u8) Error!source.FileInfo {
     const dir = std.fs.path.dirname(path) orelse "";
     return .{
@@ -1551,8 +1531,8 @@ fn fileInfoForDisk(arena: std.mem.Allocator, path: []const u8) Error!source.File
     };
 }
 
-/// The FileInfo of a file in the embedded prelude, from its forward-slash
-/// path: the directory components (for `_`-privacy) and the base name.
+/// The FileInfo of a file in the embedded core, from its forward-slash path:
+/// the directory components (for `_`-privacy) and the base name.
 fn fileInfoForPath(arena: std.mem.Allocator, fs_path: []const u8) Error!source.FileInfo {
     var out: std.ArrayList([]const u8) = .empty;
     var it = std.mem.splitScalar(u8, posixDirname(fs_path), '/');
@@ -1566,7 +1546,7 @@ fn fileInfoForPath(arena: std.mem.Allocator, fs_path: []const u8) Error!source.F
 }
 
 /// The directory of a forward-slash path, mirroring Go's path.Dir: no slash
-/// gives ".", and the parent of "." is "." (which terminates upward walks).
+/// gives ".", and the parent of "." is "." (terminating upward walks).
 fn posixDirname(path: []const u8) []const u8 {
     const i = std.mem.lastIndexOfScalar(u8, path, '/') orelse return ".";
     if (i == 0) return "/";
@@ -1574,7 +1554,7 @@ fn posixDirname(path: []const u8) []const u8 {
 }
 
 /// Lexically cleans a forward-slash path (resolving "." and ".."), mirroring
-/// Go's path.Clean for the relative paths the prelude uses.
+/// Go's path.Clean for the relative paths the core uses.
 fn posixClean(arena: std.mem.Allocator, path: []const u8) Error![]const u8 {
     var parts: std.ArrayList([]const u8) = .empty;
     var it = std.mem.splitScalar(u8, path, '/');
@@ -1600,34 +1580,38 @@ fn posixJoinClean(arena: std.mem.Allocator, dir: []const u8, path: []const u8) E
     return posixClean(arena, joined);
 }
 
-/// The predefined platform object-like macros for a target (each expands
-/// to 1), available for conditional compilation. __HCC__ is always defined
-/// separately; the arch/OS macros follow the target's arch and OS.
+/// The predefined platform object-like macros for a target (each expands to 1),
+/// for conditional compilation. __HCC__ is defined separately; the arch/OS
+/// macros follow the target's arch and OS.
 fn targetMacros(tgt: target_mod.Target) []const Define {
     const one = struct {
         fn d(name: []const u8) Define {
             return .{ .name = name, .value = "1" };
         }
     }.d;
+    // Inject only an internal axis flag per arch/OS; KConfig.HC derives the
+    // public spellings (__amd64__, __APPLE__, …) from these with #ifdef, so
+    // those macros have a real source location to jump to. The flags are
+    // underscore-namespaced and not meant to be used directly.
     const arch: []const Define = switch (tgt.arch) {
-        .amd64 => &.{one("__amd64__")},
-        .arm64 => &.{one("__arm64__")},
-        .riscv64 => &.{one("__riscv64__")},
-        .ppc64le => &.{one("__ppc64le__")},
-        .s390x => &.{one("__s390x__")},
+        .amd64 => &.{one("__HCC_ARCH_AMD64__")},
+        .arm64 => &.{one("__HCC_ARCH_ARM64__")},
+        .riscv64 => &.{one("__HCC_ARCH_RISCV64__")},
+        .ppc64le => &.{one("__HCC_ARCH_PPC64LE__")},
+        .s390x => &.{one("__HCC_ARCH_S390X__")},
     };
     const os: []const Define = switch (tgt.os) {
-        .darwin => &.{ one("__APPLE__"), one("__MACH__"), one("__unix__") },
-        .linux => &.{ one("__linux__"), one("__unix__") },
-        .windows => &.{ one("_WIN32"), one("_WIN64") },
+        .darwin => &.{one("__HCC_OS_DARWIN__")},
+        .linux => &.{one("__HCC_OS_LINUX__")},
+        .windows => &.{one("__HCC_OS_WINDOWS__")},
     };
-    // Both lists are comptime-known singletons; concatenate into a static
-    // buffer per combination via a small switch instead of allocating.
+    // Both lists are comptime-known singletons; concatenate into a static buffer
+    // instead of allocating.
     return concatDefines(arch, os);
 }
 
-/// Concatenates two small comptime-backed Define slices without allocating,
-/// by returning a slice of a static table when possible.
+/// Concatenates two small Define slices without allocating, using a static
+/// scratch buffer.
 fn concatDefines(a: []const Define, b: []const Define) []const Define {
     // The combinations are tiny and callers copy the macros out immediately via
     // addDefines, so a thread-local scratch buffer suffices.
@@ -1689,7 +1673,7 @@ test "object-like define expands with hide set" {
         \\#define N 42
         \\#define SELF SELF
         \\N SELF
-    , .{ .inject_prelude = false });
+    , .{ .inject_core = false });
     defer t.deinit();
     const toks = try t.drain();
     try testing.expectEqual(@as(usize, 2), toks.len);
@@ -1703,10 +1687,10 @@ test "define body is a token sequence and undef removes it" {
         \\TWO
         \\#undef TWO
         \\TWO
-    , .{ .inject_prelude = false });
+    , .{ .inject_core = false });
     defer t.deinit();
     const toks = try t.drain();
-    // "1 + 1" then the bare identifier TWO.
+    // "1 + 1" then the bare TWO.
     try testing.expectEqual(@as(usize, 4), toks.len);
     try testing.expect(toks[1].kind == .plus);
     try testing.expectEqualStrings("TWO", toks[3].kind.ident);
@@ -1716,7 +1700,7 @@ test "function-like macro expands with arguments" {
     var t = try TestPp.init(
         \\#define SQ(x) ((x) * (x))
         \\SQ(3 + 1)
-    , .{ .inject_prelude = false });
+    , .{ .inject_core = false });
     defer t.deinit();
     const toks = try t.drain();
     // ((3 + 1) * (3 + 1)), 13 tokens.
@@ -1730,7 +1714,7 @@ test "function-like name without parens stays an identifier" {
     var t = try TestPp.init(
         \\#define F(x) x
         \\F + F(5)
-    , .{ .inject_prelude = false });
+    , .{ .inject_core = false });
     defer t.deinit();
     const toks = try t.drain();
     // The bare F is left alone; F(5) expands to 5.
@@ -1746,7 +1730,7 @@ test "argument pre-expansion: nested calls and STR/XSTR idiom" {
         \\#define XSTR(x) STR(x)
         \\#define VER 3
         \\STR(VER) XSTR(VER)
-    , .{ .inject_prelude = false });
+    , .{ .inject_core = false });
     defer t.deinit();
     const toks = try t.drain();
     // STR(VER) is raw -> "VER"; XSTR(VER) pre-expands -> "3".
@@ -1759,7 +1743,7 @@ test "token paste with ##" {
     var t = try TestPp.init(
         \\#define CAT(a, b) a ## b
         \\CAT(foo, bar)
-    , .{ .inject_prelude = false });
+    , .{ .inject_core = false });
     defer t.deinit();
     const toks = try t.drain();
     try testing.expectEqual(@as(usize, 1), toks.len);
@@ -1771,7 +1755,7 @@ test "variadic macro and GNU comma elision" {
         \\#define P(fmt, ...) fmt, ## __VA_ARGS__
         \\P(1)
         \\P(1, 2, 3)
-    , .{ .inject_prelude = false });
+    , .{ .inject_core = false });
     defer t.deinit();
     const toks = try t.drain();
     // P(1) -> 1 (comma dropped); P(1,2,3) -> 1 , 2 , 3
@@ -1788,7 +1772,7 @@ test "wrong function-like macro arity is rejected" {
     var t = try TestPp.init(
         \\#define ADD(a, b) a + b
         \\ADD(1)
-    , .{ .inject_prelude = false });
+    , .{ .inject_core = false });
     defer t.deinit();
     try testing.expectError(error.CompileFailed, t.drain());
     try testing.expect(std.mem.indexOf(u8, t.diags.firstError().?.message, "expects 2") != null);
@@ -1810,7 +1794,7 @@ test "conditionals: ifdef/else/endif and #if expressions" {
         \\#elif 1
         \\5
         \\#endif
-    , .{ .inject_prelude = false });
+    , .{ .inject_core = false });
     defer t.deinit();
     const toks = try t.drain();
     try testing.expectEqual(@as(usize, 3), toks.len);
@@ -1819,30 +1803,65 @@ test "conditionals: ifdef/else/endif and #if expressions" {
     try testing.expectEqual(@as(i64, 4), toks[2].kind.int);
 }
 
-test "target macros seed conditionals" {
+test "compiler seeds the internal target-axis flags and __HCC__" {
+    // Without the core, only the compiler-injected macros are in scope: the
+    // internal axis flags (__HCC_ARCH_*__ / __HCC_OS_*__) and __HCC__. Public
+    // spellings like __linux__ are not; they are derived in KConfig.HC, which
+    // the core injects.
     var t = try TestPp.init(
-        \\#ifdef __linux__
+        \\#ifdef __HCC_OS_LINUX__
         \\1
         \\#endif
-        \\#ifdef __APPLE__
+        \\#ifdef __HCC_ARCH_AMD64__
         \\2
         \\#endif
         \\#if __HCC__
         \\3
         \\#endif
+        \\#ifdef __linux__
+        \\4
+        \\#endif
     , .{
-        .inject_prelude = false,
+        .inject_core = false,
         .target = .{ .arch = .amd64, .os = .linux },
     });
     defer t.deinit();
     const toks = try t.drain();
-    try testing.expectEqual(@as(usize, 2), toks.len);
+    try testing.expectEqual(@as(usize, 3), toks.len);
     try testing.expectEqual(@as(i64, 1), toks[0].kind.int);
-    try testing.expectEqual(@as(i64, 3), toks[1].kind.int);
+    try testing.expectEqual(@as(i64, 2), toks[1].kind.int);
+    try testing.expectEqual(@as(i64, 3), toks[2].kind.int);
+}
+
+test "core derives the public target macros from the axis flags" {
+    // With the core injected, KConfig.HC derives __APPLE__ etc. from the
+    // internal flags. The whole core streams first, so check via sentinel ints
+    // that the darwin block was selected and the linux one was not.
+    var t = try TestPp.init(
+        \\#ifdef __APPLE__
+        \\90011
+        \\#endif
+        \\#ifdef __linux__
+        \\90022
+        \\#endif
+    , .{
+        .inject_core = true,
+        .target = .{ .arch = .arm64, .os = .darwin },
+    });
+    defer t.deinit();
+    const toks = try t.drain();
+    var saw_apple = false;
+    var saw_linux = false;
+    for (toks) |tok| {
+        if (tok.kind == .int and tok.kind.int == 90011) saw_apple = true;
+        if (tok.kind == .int and tok.kind.int == 90022) saw_linux = true;
+    }
+    try testing.expect(saw_apple);
+    try testing.expect(!saw_linux);
 }
 
 test "unbalanced #if is reported at end of file" {
-    var t = try TestPp.init("#if 1\n1\n", .{ .inject_prelude = false });
+    var t = try TestPp.init("#if 1\n1\n", .{ .inject_core = false });
     defer t.deinit();
     var got_err = false;
     while (true) {
@@ -1858,18 +1877,18 @@ test "unbalanced #if is reported at end of file" {
 
 test "#exe with no executor is skipped, not an error" {
     // The language server runs the frontend without an executor; an #exe file
-    // must still analyze without a spurious error. The block is dropped and the
+    // must still analyze without a spurious error. The block is dropped and
     // following code resumes.
-    var t = try TestPp.init("#exe { anything(); }\n30\n", .{ .inject_prelude = false });
+    var t = try TestPp.init("#exe { anything(); }\n30\n", .{ .inject_core = false });
     defer t.deinit();
     const toks = try t.drain();
     try testing.expectEqual(@as(usize, 1), toks.len);
     try testing.expectEqual(@as(i64, 30), toks[0].kind.int);
 }
 
-/// A fake #exe executor for the hermetic tests: it ignores the unit and splices
-/// a fixed source string, so the splice/resume machinery is exercised without
-/// the backend (which the frontend module must not link).
+/// A fake #exe executor for the hermetic tests: ignores the unit and splices a
+/// fixed source string, exercising the splice/resume machinery without the
+/// backend (which the frontend module must not link).
 fn fakeExeRunner(ctx: *anyopaque, arena: std.mem.Allocator, io: std.Io, unit: []const u8, base_dir: []const u8) ExeResult {
     _ = arena;
     _ = io;
@@ -1882,14 +1901,14 @@ fn fakeExeRunner(ctx: *anyopaque, arena: std.mem.Allocator, io: std.Io, unit: []
 test "#exe splices the executor output as source" {
     var generated: []const u8 = "10 + 20";
     var t = try TestPp.init("#exe { anything }\n30\n", .{
-        .inject_prelude = false,
+        .inject_core = false,
         .exe_runner = fakeExeRunner,
         .exe_ctx = @ptrCast(&generated),
     });
     defer t.deinit();
     const toks = try t.drain();
-    // The spliced "10 + 20" streams in where the directive stood, then the 30
-    // that followed it resumes after the generated frame.
+    // The spliced "10 + 20" streams in where the directive stood, then the
+    // trailing 30 resumes after the generated frame.
     try testing.expectEqual(@as(usize, 4), toks.len);
     try testing.expectEqual(@as(i64, 10), toks[0].kind.int);
     try testing.expect(toks[1].kind == .plus);
@@ -1905,14 +1924,14 @@ test "#exe multi-line block with nested braces, then following code resumes" {
         \\}
         \\2
     , .{
-        .inject_prelude = false,
+        .inject_core = false,
         .exe_runner = fakeExeRunner,
         .exe_ctx = @ptrCast(&generated),
     });
     defer t.deinit();
     const toks = try t.drain();
-    // The nested { } inside the block does not end it early; the block is
-    // replaced by "1" and the trailing 2 resumes after it.
+    // The nested { } does not end the block early; the block becomes "1" and the
+    // trailing 2 resumes after it.
     try testing.expectEqual(@as(usize, 2), toks.len);
     try testing.expectEqual(@as(i64, 1), toks[0].kind.int);
     try testing.expectEqual(@as(i64, 2), toks[1].kind.int);
@@ -1921,7 +1940,7 @@ test "#exe multi-line block with nested braces, then following code resumes" {
 test "unterminated #exe block is reported" {
     var generated: []const u8 = "";
     var t = try TestPp.init("#exe { no close brace\n", .{
-        .inject_prelude = false,
+        .inject_core = false,
         .exe_runner = fakeExeRunner,
         .exe_ctx = @ptrCast(&generated),
     });
@@ -1930,24 +1949,24 @@ test "unterminated #exe block is reported" {
     try testing.expect(std.mem.indexOf(u8, t.diags.firstError().?.message, "unterminated") != null);
 }
 
-test "prelude injection streams the whole embedded library" {
+test "core injection streams the whole embedded library" {
     var t = try TestPp.init("I64 x;\n", .{
         .target = target_mod.Target.host(),
     });
     defer t.deinit();
     const toks = try t.drain();
-    // The prelude contributes thousands of tokens ahead of the base source,
-    // and the base source's tokens come last.
+    // The core contributes thousands of tokens ahead of the base source, whose
+    // tokens come last.
     try testing.expect(toks.len > 1000);
     try testing.expect(toks[toks.len - 1].kind == .semicolon);
     const kw = toks[toks.len - 3].kind.keyword;
     try testing.expectEqual(token_mod.Keyword.I64, kw);
-    // Every prelude file (plus the base source) landed in the file table.
+    // Every core file (plus the base source) landed in the file table.
     try testing.expectEqual(core.files.len + 1, t.pp.sourceFiles().len);
     try testing.expect(!t.diags.hasErrors());
 }
 
-test "user #include of a prelude file is reserved" {
+test "user #include of a core file is reserved" {
     var t = try TestPp.init("#include \"KConfig.HC\"\n", .{
         .target = target_mod.Target.host(),
     });
@@ -1961,7 +1980,7 @@ test "user #include of a prelude file is reserved" {
         if (tok.kind == .eof) break;
     }
     try testing.expect(failed);
-    try testing.expect(std.mem.indexOf(u8, t.diags.firstError().?.message, "implicit prelude") != null);
+    try testing.expect(std.mem.indexOf(u8, t.diags.firstError().?.message, "implicit core") != null);
 }
 
 test "disk includes: relative, nested, upward search, and cycles" {
@@ -1979,7 +1998,7 @@ test "disk includes: relative, nested, upward search, and cycles" {
 
     {
         var t = try TestPp.init("#include \"sub/a.HC\"\n9\n", .{
-            .inject_prelude = false,
+            .inject_core = false,
             .base_dir = base,
         });
         defer t.deinit();
@@ -1995,7 +2014,7 @@ test "disk includes: relative, nested, upward search, and cycles" {
     }
     {
         var t = try TestPp.init("#include \"cycle.HC\"\n", .{
-            .inject_prelude = false,
+            .inject_core = false,
             .base_dir = base,
         });
         defer t.deinit();
@@ -2004,7 +2023,7 @@ test "disk includes: relative, nested, upward search, and cycles" {
     }
     {
         var t = try TestPp.init("#include \"missing.HC\"\n", .{
-            .inject_prelude = false,
+            .inject_core = false,
             .base_dir = base,
         });
         defer t.deinit();
@@ -2040,7 +2059,7 @@ test "angle-bracket includes resolve against the search path in order" {
         // the raw `<...>` span, which the token stream doesn't preserve.
         var t = try TestPp.init(
             "#include <Dup.HC>\n#include <Only.HC>\n#include <example.com/lib/Pkg.HC>\n",
-            .{ .inject_prelude = false, .include_path = &path },
+            .{ .inject_core = false, .include_path = &path },
         );
         defer t.deinit();
         const toks = try t.drain();
@@ -2052,90 +2071,13 @@ test "angle-bracket includes resolve against the search path in order" {
     {
         // Not on any root → a clear "include path" error.
         var t = try TestPp.init("#include <Nope.HC>\n", .{
-            .inject_prelude = false,
+            .inject_core = false,
             .include_path = &path,
         });
         defer t.deinit();
         try testing.expectError(error.CompileFailed, t.pp.next());
         try testing.expect(std.mem.indexOf(u8, t.diags.firstError().?.message, "include path") != null);
     }
-}
-
-test "an hcc.toml alias expands to its import path in angle includes" {
-    const io = testing.io;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io, "pkg/example.com/lib");
-    try tmp.dir.writeFile(io, .{ .sub_path = "pkg/example.com/lib/Pkg.HC", .data = "40\n" });
-
-    const pkg = try tmp.dir.realPathFileAlloc(io, "pkg", testing.allocator);
-    defer testing.allocator.free(pkg);
-    const path = [_][]const u8{pkg};
-
-    // hcc.toml aliases `lib` to the import path `example.com/lib`.
-    var aliases: std.StringHashMapUnmanaged([]const u8) = .empty;
-    defer aliases.deinit(testing.allocator);
-    try aliases.put(testing.allocator, "lib", "example.com/lib");
-
-    {
-        // <lib/Pkg.HC> expands to <example.com/lib/Pkg.HC> and resolves (40).
-        var t = try TestPp.init(
-            "#include <lib/Pkg.HC>\n",
-            .{ .inject_prelude = false, .include_path = &path, .aliases = aliases },
-        );
-        defer t.deinit();
-        const toks = try t.drain();
-        try testing.expectEqual(@as(usize, 1), toks.len);
-        try testing.expectEqual(@as(i64, 40), toks[0].kind.int);
-    }
-    {
-        // The full import path still works with the alias map present.
-        var t = try TestPp.init(
-            "#include <example.com/lib/Pkg.HC>\n",
-            .{ .inject_prelude = false, .include_path = &path, .aliases = aliases },
-        );
-        defer t.deinit();
-        const toks = try t.drain();
-        try testing.expectEqual(@as(usize, 1), toks.len);
-        try testing.expectEqual(@as(i64, 40), toks[0].kind.int);
-    }
-    {
-        // An unknown leading segment is left untouched (no false expansion).
-        var t = try TestPp.init("#include <nope/Pkg.HC>\n", .{
-            .inject_prelude = false,
-            .include_path = &path,
-            .aliases = aliases,
-        });
-        defer t.deinit();
-        try testing.expectError(error.CompileFailed, t.pp.next());
-        try testing.expect(std.mem.indexOf(u8, t.diags.firstError().?.message, "include path") != null);
-    }
-}
-
-test "a local (absolute) alias resolves directly, off the search path" {
-    const io = testing.io;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io, "mylib");
-    try tmp.dir.writeFile(io, .{ .sub_path = "mylib/Sub.HC", .data = "50\n" });
-
-    const libdir = try tmp.dir.realPathFileAlloc(io, "mylib", testing.allocator);
-    defer testing.allocator.free(libdir);
-
-    // A local submodule alias maps to an absolute directory.
-    var aliases: std.StringHashMapUnmanaged([]const u8) = .empty;
-    defer aliases.deinit(testing.allocator);
-    try aliases.put(testing.allocator, "sub", libdir);
-
-    // No include_path at all: the alias resolves straight to the file.
-    var t = try TestPp.init(
-        "#include <sub/Sub.HC>\n",
-        .{ .inject_prelude = false, .aliases = aliases },
-    );
-    defer t.deinit();
-    const toks = try t.drain();
-    try testing.expectEqual(@as(usize, 1), toks.len);
-    try testing.expectEqual(@as(i64, 50), toks[0].kind.int);
 }
 
 test "include guards make double inclusion a no-op" {
@@ -2152,7 +2094,7 @@ test "include guards make double inclusion a no-op" {
     defer testing.allocator.free(base);
 
     var t = try TestPp.init("#include \"g.HC\"\n#include \"g.HC\"\n8\n", .{
-        .inject_prelude = false,
+        .inject_core = false,
         .base_dir = base,
     });
     defer t.deinit();

@@ -1,4 +1,4 @@
-# install.ps1 — install the hcc HolyC compiler (or the holyc-lsp language server).
+# install.ps1 — install the hcc HolyC compiler and/or the holyc-lsp language server.
 #
 # From a repo checkout it builds from source with Zig; otherwise it downloads a
 # tagged GitHub release. It verifies LLVM 21 is present (hcc links libLLVM
@@ -12,25 +12,32 @@
 #   & ([scriptblock]::Create((irm <url>/install.ps1))) -Lsp
 #
 # Options (run `.\install.ps1 -Help` for the full list):
-#   -Lsp                install holyc-lsp instead of hcc (needs neither hcc nor LLVM)
+#   -Lsp                also install holyc-lsp (the language server)
+#   -LspOnly            install only holyc-lsp (needs neither hcc nor LLVM)
+#   -Uninstall          remove the selected component(s)
 #   -Upgrade            replace an existing installation
-#   -FromSource         build from source; -Download fetches a release instead
+#   -Build              build from source; -Download fetches a release instead
 #   -Version <tag>      release tag to download (default: latest)
 #   -InstallDir <dir>   where to install
 #   -LlvmPrefix <dir>   LLVM 21 install prefix (default: auto-detected)
 #   -SkipLlvmCheck      install even if LLVM 21 is not found
 #   -NoModifyPath       do not modify PATH; print a hint instead
+#   -DryRun             show what would happen, make no changes
 #
 # Downloads auto-detect the architecture and fetch the matching release asset
 # `<bin>-<version>-<arch>-windows.tar.gz`. For Linux/macOS, use install.sh.
 
 param(
     [switch]$Lsp,
+    [switch]$LspOnly,
+    [switch]$Uninstall,
     [switch]$Upgrade,
-    [switch]$FromSource,
+    [switch]$Build,
+    [switch]$FromSource, # back-compat alias for -Build
     [switch]$Download,
     [switch]$SkipLlvmCheck,
     [switch]$NoModifyPath,
+    [switch]$DryRun,
     [string]$Version = 'latest',
     [string]$InstallDir,
     [string]$LlvmPrefix,
@@ -39,34 +46,40 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $Repo = 'project-solomon/holyc'
+$doBuild = $Build -or $FromSource
 
 function Show-Usage {
     @'
-install.ps1 — install the hcc HolyC compiler (or the holyc-lsp language server).
+install.ps1 — install the hcc HolyC compiler and/or the holyc-lsp language server.
 
 From a repo checkout it builds from source with Zig; otherwise it downloads a
-tagged GitHub release. The binary goes to a bin directory and is added to your
-PATH; for hcc it also checks that LLVM 21 is present. An existing install is
-left alone unless -Upgrade is given.
+tagged GitHub release. Binaries go to a bin directory added to your PATH; for hcc
+it also checks that LLVM 21 is present. An existing install is left alone unless
+-Upgrade is given.
 
 Usage:
   .\install.ps1 [options]
   irm https://raw.githubusercontent.com/project-solomon/holyc/main/install.ps1 | iex
 
+Components (default: hcc):
+  -Lsp               also install holyc-lsp (the language server)
+  -LspOnly           install only holyc-lsp (needs neither hcc nor LLVM)
+
 Options:
-  -Lsp               install holyc-lsp (the language server) instead of hcc
+  -Uninstall         remove the selected component(s)
   -Upgrade           replace an existing installation
-  -FromSource        build from source (needs a repo checkout and Zig)
+  -Build             build from source (needs a repo checkout and Zig)
   -Download          download a release instead of building from source
   -Version <tag>     release tag to download          (default: latest)
   -InstallDir <dir>  where to install                 (default: a per-user bin dir)
   -LlvmPrefix <dir>  LLVM 21 install prefix           (default: auto-detected)
   -SkipLlvmCheck     install even if LLVM 21 is not found
   -NoModifyPath      do not modify PATH; print a hint instead
+  -DryRun            show what would happen, make no changes
   -Help              show this help
 
-With neither -FromSource nor -Download, source is used iff run from a repo
-checkout with Zig, else a release is downloaded.
+With neither -Build nor -Download, source is used iff run from a repo checkout
+with Zig, else a release is downloaded.
 '@ | Write-Host
 }
 
@@ -74,14 +87,14 @@ if ($Help) {
     Show-Usage
     exit 0
 }
-if ($FromSource -and $Download) {
-    throw "install: pass only one of -FromSource / -Download"
+if ($doBuild -and $Download) {
+    throw "install: pass only one of -Build / -Download"
 }
 
-$Bin = 'hcc'
-# hcc by default; -Lsp swaps it for the language server (holyc-lsp needs
-# neither hcc nor LLVM). Both follow the same skip/upgrade rules.
-$Bins = if ($Lsp) { @('holyc-lsp') } else { @($Bin) }
+# ---- component set: hcc by default; -Lsp adds holyc-lsp; -LspOnly swaps to just
+# the server (holyc-lsp needs neither hcc nor LLVM). ----
+$Bins = if ($LspOnly) { @('holyc-lsp') } elseif ($Lsp) { @('hcc', 'holyc-lsp') } else { @('hcc') }
+$WantsHcc = $Bins -contains 'hcc'
 
 # ---- locate the repo, but only when run as a local file (not piped via irm) ----
 # When piped (`irm ... | iex`), $PSScriptRoot is empty, so $RepoRoot stays empty
@@ -113,8 +126,8 @@ function Test-Llvm {
 }
 
 # ---- decide download vs. build-from-source ----
-if ($FromSource) {
-    if (-not $RepoRoot) { throw "install: -FromSource needs a holyc repo checkout (run install.ps1 from the repo root)" }
+if ($doBuild) {
+    if (-not $RepoRoot) { throw "install: -Build needs a holyc repo checkout (run install.ps1 from the repo root)" }
     $fromSource = $true
 } elseif ($Download) {
     $fromSource = $false
@@ -135,7 +148,63 @@ $dir = if ($InstallDir) {
 } else {
     Join-Path $env:LOCALAPPDATA 'Programs\hcc\bin'
 }
+$root = Split-Path $dir -Parent
 $PathScope = if ($IsElevated -and -not $InstallDir) { 'Machine' } else { 'User' }
+
+# ---- uninstall: remove the selected component(s), the stdlib and bundled DLLs
+# (for hcc), and our PATH entry. Honors -DryRun. ----
+if ($Uninstall) {
+    $did = $false
+    foreach ($b in $Bins) {
+        $exe = Join-Path $dir "$b.exe"
+        if (Test-Path $exe) {
+            if ($DryRun) { Write-Host "install: would remove $exe" }
+            else { Remove-Item -Force $exe; Write-Host "install: removed $exe" }
+            $did = $true
+        }
+    }
+    if ($WantsHcc) {
+        Get-ChildItem -Path $dir -Filter '*.dll' -ErrorAction SilentlyContinue | ForEach-Object {
+            if ($DryRun) { Write-Host "install: would remove $($_.FullName)" }
+            else { Remove-Item -Force $_.FullName; Write-Host "install: removed $($_.FullName)" }
+            $did = $true
+        }
+        $stdDir = Join-Path $root 'std'
+        if (Test-Path $stdDir) {
+            if ($DryRun) { Write-Host "install: would remove $stdDir" }
+            else { Remove-Item -Recurse -Force $stdDir; Write-Host "install: removed $stdDir" }
+            $did = $true
+        }
+    }
+    if (-not $NoModifyPath) {
+        $scopePath = [Environment]::GetEnvironmentVariable('Path', $PathScope)
+        if (($scopePath -split ';') -contains $dir) {
+            if ($DryRun) { Write-Host "install: would remove $dir from the $($PathScope.ToLower()) PATH" }
+            else {
+                $new = (($scopePath -split ';') | Where-Object { $_ -ne $dir }) -join ';'
+                [Environment]::SetEnvironmentVariable('Path', $new, $PathScope)
+                Write-Host "install: removed $dir from the $($PathScope.ToLower()) PATH"
+            }
+        }
+    }
+    if (-not $did) { Write-Host "install: nothing to uninstall for $($Bins -join ', ') in $dir" }
+    exit 0
+}
+
+# ---- dry run: report the plan and stop before touching anything ----
+if ($DryRun) {
+    Write-Host "install: dry run — no changes will be made"
+    Write-Host "  components:  $($Bins -join ', ')"
+    if ($fromSource) { Write-Host "  mode:        build from source ($RepoRoot)" }
+    else { Write-Host "  mode:        download release $Version" }
+    Write-Host "  install dir: $dir"
+    if ($WantsHcc) { Write-Host "  stdlib:      $(Join-Path $root 'std')" }
+    $scopePath = [Environment]::GetEnvironmentVariable('Path', $PathScope)
+    if (($scopePath -split ';') -contains $dir) { Write-Host "  PATH:        already contains $dir" }
+    elseif ($NoModifyPath) { Write-Host "  PATH:        would print a hint for $dir" }
+    else { Write-Host "  PATH:        would add $dir to the $($PathScope.ToLower()) PATH" }
+    exit 0
+}
 
 # ---- skip when already installed (unless -Upgrade) ----
 if (-not $Upgrade) {
@@ -145,7 +214,7 @@ if (-not $Upgrade) {
     }
     # An hcc install also owns the stdlib at <root>\std; if the binary
     # is present but the stdlib isn't, there is still work to do.
-    if ((-not $Lsp) -and -not (Test-Path (Join-Path (Split-Path $dir -Parent) 'std'))) { $allPresent = $false }
+    if ($WantsHcc -and -not (Test-Path (Join-Path $root 'std'))) { $allPresent = $false }
     if ($allPresent) {
         Write-Host "install: $($Bins -join ', ') already installed in $dir — nothing to do (use -Upgrade to replace)"
         exit 0
@@ -157,20 +226,21 @@ New-Item -ItemType Directory -Force -Path $dir | Out-Null
 $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("hcc-" + [System.Guid]::NewGuid())
 New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 try {
-    # holyc-lsp never touches LLVM; only an hcc install needs the check.
-    if (-not $Lsp) { Test-Llvm }
+    # Only an hcc install needs LLVM; holyc-lsp never touches it.
+    if ($WantsHcc) { Test-Llvm }
     if ($fromSource) {
         if (-not $haveZig) { throw "install: building from source needs Zig 0.16 (https://ziglang.org/download/); or pass -Download to fetch a release" }
         Write-Host "install: building $($Bins -join ', ') from source ($RepoRoot)"
         Push-Location $RepoRoot
         try {
-            # Per-artifact build steps, so an LSP-only install never links
-            # (or requires) LLVM.
-            $buildStep = if ($Lsp) { 'lsp' } else { 'hcc' }
+            # Per-artifact build steps (hcc→hcc, holyc-lsp→lsp), so an LSP-only
+            # install never links (or requires) LLVM.
+            $steps = @()
+            foreach ($b in $Bins) { if ($b -eq 'hcc') { $steps += 'hcc' } elseif ($b -eq 'holyc-lsp') { $steps += 'lsp' } }
             if ($LlvmPrefix) {
-                & zig build $buildStep -Doptimize=ReleaseSafe "-Dllvm-prefix=$LlvmPrefix"
+                & zig build @steps -Doptimize=ReleaseSafe "-Dllvm-prefix=$LlvmPrefix"
             } else {
-                & zig build $buildStep -Doptimize=ReleaseSafe
+                & zig build @steps -Doptimize=ReleaseSafe
             }
             if ($LASTEXITCODE -ne 0) { throw "install: zig build failed" }
             foreach ($b in $Bins) {
@@ -180,7 +250,7 @@ try {
             }
             # Stage the standard-library source tree beside the staged binary,
             # so the install step below places it at <root>\std.
-            if (-not $Lsp) { Copy-Item -Recurse -Force (Join-Path $RepoRoot 'std') (Join-Path $tmp 'std') }
+            if ($WantsHcc) { Copy-Item -Recurse -Force (Join-Path $RepoRoot 'std') (Join-Path $tmp 'std') }
         } finally { Pop-Location }
     } else {
         # ---- detect architecture ----
@@ -237,14 +307,23 @@ try {
         Write-Host "install: installed $b to $dest"
     }
 
-    # ---- install the standard library beside the hcc binary (not for -Lsp) ----
+    # ---- install bundled runtime DLLs beside the binaries (Windows hcc) ----
+    # The Windows hcc.exe links libLLVM.dll dynamically; the release asset carries
+    # it plus its mingw runtime deps at the archive root, and they must sit next
+    # to hcc.exe to be found. The lsp asset carries none, so this is a no-op there.
+    Get-ChildItem -Path $tmp -Filter '*.dll' -ErrorAction SilentlyContinue | ForEach-Object {
+        Copy-Item -Path $_.FullName -Destination (Join-Path $dir $_.Name) -Force
+        Write-Host "install: installed $($_.Name) to $dir"
+    }
+
+    # ---- install the standard library beside the hcc binary (hcc only) ----
     # hcc discovers it as HCC_ROOT\std relative to its own path — <root>\std,
-    # where <prefix> is the parent of the bin dir. In download mode this expects
-    # the release tarball to carry a top-level std\ dir (a new asset convention);
-    # older tarballs without it simply skip the stdlib.
+    # where <root> is the parent of the bin dir. In download mode this expects
+    # the release tarball to carry a top-level std\ dir; older tarballs without it
+    # simply skip the stdlib.
     $stdSrc = Join-Path $tmp 'std'
-    if ((-not $Lsp) -and (Test-Path $stdSrc)) {
-        $stdDir = Join-Path (Split-Path $dir -Parent) 'std'
+    if ($WantsHcc -and (Test-Path $stdSrc)) {
+        $stdDir = Join-Path $root 'std'
         New-Item -ItemType Directory -Force -Path $stdDir | Out-Null
         Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $stdDir '*.HC')
         Copy-Item -Path (Join-Path $stdSrc '*.HC') -Destination $stdDir -Force
@@ -264,8 +343,9 @@ if (($scopePath -split ';') -notcontains $dir) {
         Write-Host "install: added $dir to the $($PathScope.ToLower()) PATH (restart your shell to pick it up)"
     }
 }
-if ($Lsp) {
+if ($WantsHcc) {
+    Write-Host "`nRun: hcc --help"
+}
+if ((-not $WantsHcc) -or $Lsp) {
     Write-Host "`nholyc-lsp speaks LSP over stdio — point your editor at it"
-} else {
-    Write-Host "`nRun: $Bin --help"
 }

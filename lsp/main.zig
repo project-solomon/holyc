@@ -27,17 +27,15 @@ pub fn main(init: std.process.Init) !void {
     );
     defer server.deinit();
 
-    // The angle-bracket #include search path (HCC_PATH/pkg, HCC_ROOT/std),
+    // The angle-bracket #include search path (HCC_ROOT/pkg, HCC_ROOT/std),
     // resolved the same way hcc does, so the editor sees the standard library
     // and third-party packages. Lives for the server's lifetime; best-effort
     // (a path that cannot be resolved leaves std includes unresolved).
     var include_arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
     defer include_arena.deinit();
     server.include_path = Server.computeIncludePath(include_arena.allocator(), io, init.environ_map) catch &.{};
-    // The package root, so the editor resolves hcc.toml alias includes like hcc.
-    server.pkg_dir = Server.pkgDir(include_arena.allocator(), io, init.environ_map);
 
-    // Where the embedded prelude is extracted so go-to-definition can jump into
+    // Where the embedded core is extracted so go-to-definition can jump into
     // it (`<HCC_ROOT>/.cache/core`). gpa-owned; freed in server.deinit.
     server.core_cache_dir = Server.coreCacheDir(std.heap.smp_allocator, io, init.environ_map);
 

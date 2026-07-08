@@ -1,14 +1,14 @@
-//! A stable, human-readable AST dump: one node per line, indented children,
-//! inferred types shown when sema has run. Drives `hcc --emit ast` and doubles
-//! as a regression net for parser changes.
+//! Human-readable AST dump: one node per line, indented children, inferred
+//! types shown when sema has run. Drives `hcc --emit ast` and serves as a
+//! regression net for parser changes.
 
 const std = @import("std");
 const ast = @import("ast.zig");
 const source = @import("source.zig");
 
 pub const Options = struct {
-    /// Hide items that came from the injected prelude (any file other than the
-    /// root source), so a program's dump shows the user's code only.
+    /// Hide items from the injected core (any file other than the root source),
+    /// so the dump shows only the user's code.
     user_code_only: bool = true,
 };
 

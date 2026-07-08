@@ -73,7 +73,7 @@ const AsmFixture = struct {
 /// Parses body (an `asm { … }` block placed inside a function F) and returns
 /// F's AsmStmt — the Zig replica of Go's parseAsmBlock.
 fn parseAsmBlock(comptime body: []const u8) !AsmFixture {
-    var tp = try TestParse.init("U0 F()\n{\n" ++ body ++ "\n}\n", .{ .inject_prelude = false });
+    var tp = try TestParse.init("U0 F()\n{\n" ++ body ++ "\n}\n", .{ .inject_core = false });
     errdefer tp.deinit();
     const a = findFnAsm(tp.prog, "F") orelse return error.TestUnexpectedResult;
     return .{ .tp = tp, .a = a };
@@ -201,7 +201,7 @@ test "arch-paired asm sources parse" {
         \\}
         \\"%d\n", F(1);
         \\
-    , .{ .inject_prelude = false });
+    , .{ .inject_core = false });
     defer unpaired.deinit();
     const uf = fnDef(unpaired.prog, "F").?;
     try testing.expectEqualStrings("arm64", uf.body.?[0].kind.asm_stmt.arch);
@@ -214,7 +214,7 @@ test "arch-paired asm sources parse" {
         \\}
         \\"%d\n", F(1);
         \\
-    , .{ .inject_prelude = false });
+    , .{ .inject_core = false });
     defer paired.deinit();
     const pf = fnDef(paired.prog, "F").?;
     try testing.expectEqualStrings("amd64", pf.body.?[0].kind.asm_stmt.arch);
@@ -225,7 +225,7 @@ test "arch-paired asm sources parse" {
         \\U0 F() { asm arm64 { STR X9, g } }
         \\F();
         \\
-    , .{ .inject_prelude = false });
+    , .{ .inject_core = false });
     defer global.deinit();
     const ga = findFnAsm(global.prog, "F").?;
     try testing.expectEqualStrings("g", ga.insts[0].operands[1].kind.variable);
@@ -234,7 +234,7 @@ test "arch-paired asm sources parse" {
 // ---- targeted unit tests for the quirky parses ----
 
 test "paren-less call statement stays a bare identifier" {
-    var tp = try TestParse.init("U0 Hello()\n{\n}\nHello;\n", .{ .inject_prelude = false });
+    var tp = try TestParse.init("U0 Hello()\n{\n}\nHello;\n", .{ .inject_core = false });
     defer tp.deinit();
     // The definition has an empty (non-null) body: it is not a prototype.
     const f = fnDef(tp.prog, "Hello").?;
@@ -245,7 +245,7 @@ test "paren-less call statement stays a bare identifier" {
 }
 
 test "implicit print statement is a comma expression" {
-    var tp = try TestParse.init("I64 x = 1;\n\"x = %d\\n\", x;\n", .{ .inject_prelude = false });
+    var tp = try TestParse.init("I64 x = 1;\n\"x = %d\\n\", x;\n", .{ .inject_core = false });
     defer tp.deinit();
     const items = tp.prog.items[1].kind.expr.kind.comma;
     try testing.expectEqual(@as(usize, 2), items.len);
@@ -259,7 +259,7 @@ test "default and skipped arguments" {
         \\Box(, 5);
         \\Box();
         \\
-    , .{ .inject_prelude = false });
+    , .{ .inject_core = false });
     defer tp.deinit();
     const f = fnDef(tp.prog, "Box").?;
     try testing.expectEqual(@as(usize, 2), f.params.len);
@@ -303,7 +303,7 @@ test "switch: nobounds, case ranges, auto cases, sublabels, sub_switch" {
         \\  }
         \\}
         \\
-    , .{ .inject_prelude = false });
+    , .{ .inject_core = false });
     defer tp.deinit();
 
     const f = fnDef(tp.prog, "F").?;
@@ -338,7 +338,7 @@ test "class with base, anonymous embedded union, field meta, inline instances" {
         \\  I64 y format "%X" data 7;
         \\} d1, *d2;
         \\
-    , .{ .inject_prelude = false });
+    , .{ .inject_core = false });
     defer tp.deinit();
     const items = tp.prog.items;
     try testing.expectEqual(@as(usize, 4), items.len);
@@ -382,7 +382,7 @@ test "designated initializer and init list" {
         \\Point pt = {.x = 1, .y = 2};
         \\I64 arr[3] = {1, 2, 3};
         \\
-    , .{ .inject_prelude = false });
+    , .{ .inject_core = false });
     defer tp.deinit();
 
     const pt = tp.prog.items[1].kind.var_decl[0];
@@ -405,7 +405,7 @@ test "no_warn directive" {
         \\  no_warn a, b;
         \\}
         \\
-    , .{ .inject_prelude = false });
+    , .{ .inject_core = false });
     defer tp.deinit();
     const names = fnDef(tp.prog, "F").?.body.?[1].kind.no_warn;
     try testing.expectEqual(@as(usize, 2), names.len);
@@ -421,7 +421,7 @@ test "reg-pinned and noreg locals" {
         \\  return acc;
         \\}
         \\
-    , .{ .inject_prelude = false });
+    , .{ .inject_core = false });
     defer tp.deinit();
     const decls = fnDef(tp.prog, "F").?.body.?[0].kind.var_decl;
     try testing.expectEqual(@as(usize, 2), decls.len);
@@ -441,7 +441,7 @@ test "prefix casts, including known class names" {
         \\I64 x = (I64)f;
         \\C *c = (C*)0;
         \\
-    , .{ .inject_prelude = false });
+    , .{ .inject_core = false });
     defer tp.deinit();
     const x_cast = tp.prog.items[2].kind.var_decl[0].init.?.kind.cast;
     try testing.expect(x_cast.ty.isPrim(.I64));
@@ -455,7 +455,7 @@ test "postfix cast form is not parsed" {
     // a type keyword in argument position, which is a parse error.
     try testing.expectError(
         error.CompileFailed,
-        TestParse.init("I64 x;\nx(I64);\n", .{ .inject_prelude = false }),
+        TestParse.init("I64 x;\nx(I64);\n", .{ .inject_core = false }),
     );
 }
 
@@ -466,7 +466,7 @@ test "backtick pow, logical xor, chained comparisons, precedence" {
         \\I64 c = 1 < 2 < 3;
         \\I64 d = 1 + 2 << 3;
         \\
-    , .{ .inject_prelude = false });
+    , .{ .inject_core = false });
     defer tp.deinit();
 
     // ` is right-associative: 2`(3`2).
@@ -503,7 +503,7 @@ test "function-pointer declarator, implicit params, varargs" {
         \\  return base;
         \\}
         \\
-    , .{ .inject_prelude = false });
+    , .{ .inject_core = false });
     defer tp.deinit();
 
     const op_decl = tp.prog.items[0].kind.var_decl[0];
@@ -534,7 +534,7 @@ test "_extern asm label and extern import declarations" {
         \\_extern T I64 Triple(I64 x);
         \\extern I64 write(I64 fd, U8 *buf, I64 n);
         \\
-    , .{ .inject_prelude = false });
+    , .{ .inject_core = false });
     defer tp.deinit();
 
     try testing.expect(tp.prog.items[0].kind.asm_stmt.definesLabel());
@@ -561,7 +561,7 @@ test "sizeof, offset, lastclass" {
         \\{
         \\}
         \\
-    , .{ .inject_prelude = false });
+    , .{ .inject_core = false });
     defer tp.deinit();
 
     const a_sizeof = tp.prog.items[1].kind.var_decl[0].init.?.kind.sizeof;
@@ -592,7 +592,7 @@ test "public declarations" {
         \\{
         \\}
         \\
-    , .{ .inject_prelude = false });
+    , .{ .inject_core = false });
     defer tp.deinit();
     try testing.expect(tp.prog.items[0].kind.var_decl[0].is_public);
     try testing.expect(tp.prog.items[1].kind.func_def.is_public);
@@ -615,7 +615,7 @@ test "lock block and bare throw" {
         \\  }
         \\}
         \\
-    , .{ .inject_prelude = false });
+    , .{ .inject_core = false });
     defer tp.deinit();
     const body = fnDef(tp.prog, "F").?.body.?;
     try testing.expectEqual(@as(usize, 1), body[0].kind.lock.len);
@@ -631,7 +631,7 @@ test "anonymous aggregate type is hoisted to the top level" {
         \\{
         \\}
         \\
-    , .{ .inject_prelude = false });
+    , .{ .inject_core = false });
     defer tp.deinit();
     const items = tp.prog.items;
     // VarDecl a,b; FuncDef F; then the two hoisted synthetic ClassDefs.

@@ -1,9 +1,8 @@
 //! Byte-offset ↔ LSP position conversion.
 //!
 //! LSP positions are 0-based line/character pairs where `character` counts
-//! UTF-16 code units. HolyC sources are ASCII in practice, so this module
-//! counts bytes instead: exact for ASCII, approximate for any stray
-//! multi-byte UTF-8.
+//! UTF-16 code units. HolyC sources are ASCII, so this module counts bytes:
+//! exact for ASCII, approximate for stray multi-byte UTF-8.
 
 const std = @import("std");
 

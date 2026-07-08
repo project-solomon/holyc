@@ -1,27 +1,24 @@
-//! The HolyC AST: types, expressions, statements, declarations, inline-asm
-//! nodes, and the whole-program node. Nodes are arena-allocated and linked by
-//! pointer; each node's shape is an exhaustive `union(enum)`.
+//! The HolyC AST: types, expressions, statements, declarations, inline asm,
+//! and the whole-program node. Nodes are arena-allocated and linked by pointer;
+//! each node's shape is a `union(enum)`.
 
 const std = @import("std");
 const source = @import("source.zig");
 
-/// The span.file sentinel for compiler-synthesized declarations that should
-/// bypass file-privacy checks. No real source file has this id, so privacy is
-/// enforced normally for everything the parser produces.
+/// span.file sentinel for compiler-synthesized declarations that bypass
+/// file-privacy checks. No real source file has this id.
 pub const generated_file: u32 = std.math.maxInt(u32);
 
-/// Whether a field name is the generated placeholder for an anonymous
-/// embedded union/struct, whose members are promoted into the enclosing
-/// class.
+/// Whether a field name is the placeholder for an anonymous embedded
+/// union/struct, whose members are promoted into the enclosing class.
 pub fn isAnonField(name: []const u8) bool {
     return std.mem.startsWith(u8, name, "$anon");
 }
 
 // ---- types ----
 
-/// A HolyC type. A prim for the scalar built-ins; the composite variants hold
-/// arena-allocated children. An expression whose `ty` is null has not been
-/// typed by sema yet.
+/// A HolyC type. `prim` for scalar built-ins; composite variants hold
+/// arena-allocated children. An expression whose `ty` is null is not yet typed.
 pub const Type = union(enum) {
     prim: Prim,
     /// A class or union type referenced by name.
@@ -30,8 +27,8 @@ pub const Type = union(enum) {
     ptr: *const Type,
     /// `T[n]`; size is null for an unsized array (`T[]`).
     array: Array,
-    /// A function pointer `ret (*)(params...)`: an 8-byte scalar like any
-    /// pointer; the signature drives call type-checking.
+    /// A function pointer `ret (*)(params...)`: an 8-byte scalar; the signature
+    /// drives call type-checking.
     func_ptr: FuncPtr,
 
     pub const Array = struct {
@@ -44,8 +41,8 @@ pub const Type = union(enum) {
         params: []const Type,
     };
 
-    /// A built-in scalar type. HolyC's default integer is I64 and there is no
-    /// F32. Tag names are the exact source spellings.
+    /// A built-in scalar. HolyC's default integer is I64; there is no F32. Tag
+    /// names are the source spellings.
     pub const Prim = enum {
         U0, // void
         I0, // void (signed sibling of U0; zero-size, behaves identically)
@@ -75,14 +72,12 @@ pub const Type = union(enum) {
         };
     }
 
-    /// Shorthand for testing against a specific scalar, e.g.
-    /// `t.isPrim(.F64)`.
+    /// Test against a specific scalar, e.g. `t.isPrim(.F64)`.
     pub fn isPrim(ty: Type, p: Prim) bool {
         return ty == .prim and ty.prim == p;
     }
 
-    /// Renders a type for diagnostics; a null type (not yet inferred by sema)
-    /// renders as "?".
+    /// Renders a type for diagnostics; a null type renders as "?".
     pub fn render(ty: ?Type, w: *std.Io.Writer) std.Io.Writer.Error!void {
         const t = ty orelse return w.writeAll("?");
         switch (t) {
@@ -238,19 +233,19 @@ pub const AssignOp = enum {
 
 // ---- expressions ----
 
-/// An expression node: its shape, its source span, and (after semantic
-/// analysis) its inferred type (null until sema runs).
+/// An expression node: its shape, source span, and inferred type (null until
+/// sema runs).
 pub const Expr = struct {
     kind: Kind,
     span: source.Span,
     ty: ?Type = null,
 
     pub const Kind = union(enum) {
-        /// An integer literal, already parsed.
+        /// An integer literal.
         int_lit: i64,
         /// A floating-point literal (HolyC only has F64).
         float_lit: f64,
-        /// A string literal with escapes already resolved.
+        /// A string literal, escapes resolved.
         str_lit: []const u8,
         /// A character constant: HolyC packs up to 8 chars little-endian into
         /// an I64, e.g. 'AB' == 0x4241.
@@ -272,7 +267,7 @@ pub const Expr = struct {
         index: struct { base: *Expr, index: *Expr },
         /// A field access, base.field or base->field.
         member: struct { base: *Expr, field: []const u8, arrow: bool },
-        /// A type cast, (Ty)expr — also HolyC's postfix cast `expr(Ty)`.
+        /// A type cast, (Ty)expr, or HolyC's postfix cast `expr(Ty)`.
         cast: struct { ty: Type, expr: *Expr },
         /// sizeof(Type) or sizeof(expr); exactly one is set. Computed at
         /// compile time (for an expr, from its inferred type).
@@ -290,11 +285,9 @@ pub const Expr = struct {
         /// A comma-separated sequence. At statement level this is also HolyC's
         /// implicit print: `"x = %d\n", x` is a comma of [str_lit, ident].
         comma: []const *Expr,
-        /// HolyC's `lastclass`, used as a parameter's default value
-        /// (`U8 *cn = lastclass`). At each call site it stands for the
-        /// class-name string of the preceding argument. Its static type is
-        /// U8*. Outside a default it has no preceding argument and lowers
-        /// to "".
+        /// HolyC's `lastclass`, a parameter default (`U8 *cn = lastclass`). At
+        /// each call site it stands for the class-name string of the preceding
+        /// argument; its static type is U8*. Outside a default it lowers to "".
         lastclass,
     };
 
@@ -338,8 +331,8 @@ pub const Expr = struct {
                 }
                 return false;
             },
-            // Literals, ident, sizeof, offset: nothing to recurse into. A
-            // sizeof's expression operand is not walked.
+            // Literals, ident, sizeof, offset: nothing to recurse into (a
+            // sizeof's expr operand is not walked).
             else => return false,
         }
     }
@@ -392,18 +385,17 @@ fn containsName(names: []const []const u8, name: []const u8) bool {
 
 /// A local variable's register storage class.
 pub const RegMode = enum {
-    /// The default: the backend chooses the storage.
+    /// Default: the backend chooses storage.
     none,
-    /// `reg`: keep the variable register-resident. When reg_name is set it is
-    /// pinned to that physical register for the variable's whole lifetime.
+    /// `reg`: keep the variable register-resident. When reg_name is set, pin it
+    /// to that physical register for its whole lifetime.
     reg,
     /// `noreg`: force the variable onto the stack.
     noreg,
 };
 
-/// One `key value` member-metadata entry on a class field, where key is an
-/// identifier (e.g. `format`, `data`) and value is a string or integer
-/// literal.
+/// One `key value` member-metadata entry on a class field. key is an
+/// identifier (e.g. `format`); value is a string or integer literal.
 pub const FieldMeta = struct {
     key: []const u8,
     value: union(enum) {
@@ -419,18 +411,17 @@ pub const Declarator = struct {
     ty: Type,
     init: ?*Expr = null,
     span: source.Span,
-    /// The `public` modifier: a top-level global declared public is visible
-    /// from any file, otherwise it is private to its defining file.
-    /// Meaningless for locals and class fields.
+    /// `public`: a top-level global is visible from any file, otherwise private
+    /// to its defining file. Meaningless for locals and class fields.
     is_public: bool = false,
-    /// HolyC member metadata attached to a class field (e.g. `format "%X"`).
-    /// Empty for ordinary variables and metadata-free fields; surfaced through
-    /// class reflection (CMemberLst.meta).
+    /// HolyC member metadata on a class field (e.g. `format "%X"`). Empty for
+    /// variables and metadata-free fields; surfaced through class reflection
+    /// (CMemberLst.meta).
     meta: []const FieldMeta = &.{},
-    /// The `reg`/`noreg` storage class on a function local (HolyC writes it
-    /// after the type, before the name: `I64 reg R15 i, noreg j;`). reg_name
-    /// is the pinned physical register for `reg <REG> name`, "" otherwise.
-    /// Meaningless for globals, params, and class fields.
+    /// `reg`/`noreg` storage class on a function local (HolyC writes it after
+    /// the type, before the name: `I64 reg R15 i, noreg j;`). reg_name is the
+    /// pinned register for `reg <REG> name`, "" otherwise. Meaningless for
+    /// globals, params, and class fields.
     reg_mode: RegMode = .none,
     reg_name: []const u8 = "",
 };
@@ -455,26 +446,22 @@ pub const FuncDef = struct {
     /// Null for a prototype (`...;`) and non-null for a definition (an empty
     /// definition body is an empty, non-null slice).
     body: ?[]const *Stmt = null,
-    /// The `public` modifier: a public function is callable from any file,
-    /// otherwise it is private to its defining file.
+    /// `public`: callable from any file, otherwise private to its defining file.
     is_public: bool = false,
     /// Binds this declaration to an asm-defined label of a different name
-    /// (`_extern <LABEL> <sig>;`). When non-empty the function has no body: it
-    /// is a typed forward reference, and call sites emit a call to asm_label
-    /// instead of name.
+    /// (`_extern <LABEL> <sig>;`). When non-empty the function has no body: a
+    /// typed forward reference whose call sites call asm_label, not name.
     asm_label: []const u8 = "",
-    /// Marks a dynamic-library import (`extern <ret> <name>(<params>);`): the
-    /// function has no body and call sites bind it at load time rather than
-    /// resolving to a HolyC definition.
+    /// Marks a dynamic-library import (`extern <ret> <name>(<params>);`): no
+    /// body, bound at load time rather than to a HolyC definition.
     import: bool = false,
 
     pub fn isPrototype(f: *const FuncDef) bool {
         return f.body == null;
     }
 
-    /// Whether f declares name as a parameter or as a local (a var_decl
-    /// anywhere in its body, including nested blocks/loops), so a use of name
-    /// in f resolves to that local, not a global.
+    /// Whether f declares name as a parameter or local (a var_decl anywhere in
+    /// its body), so a use of name in f resolves to that local, not a global.
     pub fn declaresName(f: *const FuncDef, name: []const u8) bool {
         for (f.params) |p| {
             if (std.mem.eql(u8, p.name, name)) return true;
@@ -491,8 +478,7 @@ pub const ClassDef = struct {
     /// `class Foo : Bar` inheritance; "" if none.
     base: []const u8 = "",
     fields: []const Declarator,
-    /// The `public` modifier. Compiler-synthesized aggregates are always
-    /// public.
+    /// `public`. Compiler-synthesized aggregates are always public.
     is_public: bool = false,
 };
 
@@ -510,11 +496,11 @@ pub const Stmt = struct {
         expr: *Expr,
         /// A brace-enclosed sequence of statements.
         block: []const *Stmt,
-        /// HolyC's `lock { … }`: a block whose read-modify-write operations
-        /// are atomic across cores. It scopes like a block.
+        /// HolyC's `lock { … }`: a block whose read-modify-write operations are
+        /// atomic across cores. Scopes like a block.
         lock: []const *Stmt,
-        /// HolyC's `no_warn a, b;`: a compile-time directive that suppresses
-        /// the unused-variable warning for the named in-scope locals.
+        /// HolyC's `no_warn a, b;`: suppresses the unused-variable warning for
+        /// the named in-scope locals.
         no_warn: []const []const u8,
         /// Declares one or more variables.
         var_decl: []const Declarator,
@@ -523,23 +509,21 @@ pub const Stmt = struct {
         do_while: struct { body: *Stmt, cond: *Expr },
         /// A C-style for loop; init, cond, and step are each null if absent.
         for_stmt: struct { init: ?*Stmt, cond: ?*Expr, step: ?*Expr, body: *Stmt },
-        /// A switch. no_bounds is HolyC's `switch [expr]` form, which omits
-        /// the range check before jump-table dispatch. sub marks
-        /// `sub_switch (expr)`: a nested switch that must appear within an
-        /// enclosing switch and relies on the parent's range check; it is
-        /// otherwise an ordinary switch.
+        /// A switch. no_bounds is HolyC's `switch [expr]` form, which omits the
+        /// range check before jump-table dispatch. sub marks `sub_switch (expr)`:
+        /// a nested switch that relies on the enclosing switch's range check.
         switch_stmt: struct { cond: *Expr, body: *Stmt, no_bounds: bool = false, sub: bool = false },
         /// A `case` label. hi is set for range labels `case lo ... hi:`. lo is
-        /// null for a numberless `case:`, whose value is the next integer
-        /// after the previous case (the first such case is 0).
+        /// null for a numberless `case:`, whose value is the previous case's
+        /// plus one (0 for the first).
         case: struct { lo: ?*Expr, hi: ?*Expr },
         /// A switch `default:` label.
         default,
-        /// HolyC's `start:` switch sub-label: the start of a switch prologue
-        /// (statements that run on entry, before dispatch).
+        /// HolyC's `start:` switch sub-label: a switch prologue (runs on entry,
+        /// before dispatch).
         switch_start,
-        /// HolyC's `end:` switch sub-label: the start of a switch epilogue
-        /// (statements reached by fall-through; a `break` skips them).
+        /// HolyC's `end:` switch sub-label: a switch epilogue (reached by
+        /// fall-through; a `break` skips it).
         switch_end,
         break_stmt,
         /// `return;` or `return expr;`.
@@ -550,8 +534,8 @@ pub const Stmt = struct {
         /// try { body } catch { handler }. The catch block takes no parameter
         /// (HolyC form); the thrown value is Fs->except_ch.
         try_stmt: struct { body: []const *Stmt, handler: []const *Stmt },
-        /// `throw expr;` raising an exception carrying expr's value (coerced
-        /// to I64); a bare `throw;` (null) re-raises the current Fs->except_ch.
+        /// `throw expr;` raising expr's value (coerced to I64); a bare `throw;`
+        /// (null) re-raises the current Fs->except_ch.
         throw: ?*Expr,
         func_def: *FuncDef,
         class_def: *ClassDef,
@@ -684,20 +668,19 @@ pub fn stmtsHaveExceptions(stmts: []const *Stmt) bool {
 // ---- inline assembly ----
 
 /// An `asm [arch] { … }` inline-assembly block. A bare `asm { … }` defaults to
-/// amd64 (HolyC is an x86-64 language); `asm amd64 { … }` states it explicitly
-/// and `asm arm64 { … }` targets AArch64. A block is a flat list of
-/// instructions and label declarations.
+/// amd64; `asm amd64 { … }` states it explicitly and `asm arm64 { … }` targets
+/// AArch64. A flat list of instructions and label declarations.
 pub const AsmStmt = struct {
     /// The target architecture: "amd64" (the default for a bare block) or
     /// "arm64". Sema validates it.
     arch: []const u8,
-    /// The span of the architecture qualifier, or of the `asm` keyword when
-    /// the block is bare, so sema can point at something for an unknown arch.
+    /// Span of the architecture qualifier, or the `asm` keyword when the block
+    /// is bare, so sema can point at an unknown arch.
     arch_span: source.Span,
     insts: []const AsmInst,
 
     /// Whether the block declares any label. A labelled top-level block is
-    /// standalone, callable code (bound to a HolyC name by `_extern`); a
+    /// standalone callable code (bound to a HolyC name by `_extern`); a
     /// labelless block is inline asm spliced into the enclosing function.
     pub fn definesLabel(a: *const AsmStmt) bool {
         for (a.insts) |inst| {
@@ -747,8 +730,7 @@ pub const AsmOperand = struct {
         reg: []const u8,
         /// An integer immediate.
         imm: i64,
-        /// A HolyC variable referenced by bare name (resolved during
-        /// lowering).
+        /// A HolyC variable referenced by bare name (resolved during lowering).
         variable: []const u8,
         /// `&name`: the address of a label, function, or global.
         sym: []const u8,
@@ -758,7 +740,7 @@ pub const AsmOperand = struct {
 };
 
 /// A memory operand `[<base> + <index>*<scale> + <disp>]`, optionally with a
-/// leading type that gives the access width, as in TempleOS HolyC's
+/// leading type giving the access width, as in TempleOS HolyC's
 /// `U64 SF_ARG1[RBP]`. Any component may be absent. disp_sym is a symbolic
 /// displacement (a constant identifier such as SF_ARG1) resolved during
 /// lowering; disp is the constant part.
@@ -796,9 +778,9 @@ pub const isAsmRegister = asm_regs.isRegister;
 /// of statements, which may include function and class definitions.
 pub const Program = struct {
     items: []const *Stmt,
-    /// The source files seen during parsing, indexed by span.file. Each entry
-    /// carries the file's directory, which sema uses for directory privacy
-    /// checks. Provenance metadata: not part of structural equality.
+    /// Source files seen during parsing, indexed by span.file. Each carries the
+    /// file's directory, used by sema for directory privacy checks. Provenance:
+    /// not part of structural equality.
     files: []const source.FileInfo,
     /// The computed in-memory layout of every class/union, filled in by the
     /// layout pass; null until that pass runs.

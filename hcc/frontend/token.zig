@@ -3,7 +3,7 @@
 const std = @import("std");
 const source = @import("source.zig");
 
-/// A HolyC keyword: a reserved word or built-in type name. The lexer recognises
+/// A HolyC keyword: reserved word or built-in type name. The lexer recognises
 /// keywords directly (`Keyword.fromString`), so the parser never string-compares
 /// identifiers. Each tag's name is the keyword's exact source spelling.
 pub const Keyword = enum {
@@ -51,26 +51,25 @@ pub const Keyword = enum {
     start,
     end,
 
-    // Storage classes: `reg`/`noreg` are the register-placement storage class
-    // on a local (`I64 reg R15 i, noreg j;`).
+    // Register-placement storage class on a local (`I64 reg R15 i, noreg j;`).
     reg,
     noreg,
 
     // Inline assembly: `asm [arch] { … }`.
     @"asm",
 
-    // Asm linkage: `_extern <LABEL> <sig>;` binds a HolyC name to an
-    // asm-defined label; `_import` is accepted as an alias.
+    // Asm linkage: `_extern <LABEL> <sig>;` binds a HolyC name to an asm label.
+    // (`_import` is TempleOS JIT load-time binding, meaningless in an AOT
+    // compiler, so it is not a keyword.)
     _extern,
-    _import,
 
     // Dynamic-library import: `extern <ret> <name>(<params>);` declares a
-    // function provided by a shared library, bound at load time.
+    // function from a shared library, bound at load time.
     @"extern",
 
-    // Reserved HolyC keywords: lexed so they stay reserved words (using one as
-    // an identifier is rejected, matching TempleOS), but unimplemented. Neither
-    // is matched by the parser.
+    // Reserved but unimplemented: lexed so they stay reserved (using one as an
+    // identifier is rejected, matching TempleOS). Neither is matched by the
+    // parser.
     lastclass,
     no_warn,
 
@@ -89,12 +88,12 @@ pub const Keyword = enum {
         return spellings.get(s);
     }
 
-    /// The keyword's canonical source spelling (e.g. .@"if" -> "if").
+    /// The keyword's source spelling (e.g. .@"if" -> "if").
     pub fn spelling(k: Keyword) []const u8 {
         return @tagName(k);
     }
 
-    /// Whether the keyword names a built-in type. This lets the parser tell
+    /// Whether the keyword names a built-in type, so the parser can tell
     /// declarations from expression statements.
     pub fn isType(k: Keyword) bool {
         return switch (k) {
@@ -104,9 +103,9 @@ pub const Keyword = enum {
     }
 };
 
-/// A lexed token: its kind (with the decoded payload for literal kinds) and
-/// where it came from. Compare against a payload-free kind with
-/// `tok.kind == .plus`; match payload kinds with a switch capture.
+/// A lexed token: its kind (with decoded payload for literal kinds) and source
+/// span. Compare a payload-free kind with `tok.kind == .plus`; match payload
+/// kinds with a switch capture.
 pub const Token = struct {
     kind: Kind,
     span: source.Span = .{},
@@ -114,19 +113,18 @@ pub const Token = struct {
     pub const Kind = union(enum) {
         // ---- Literals & names ----
 
-        /// An integer literal (decimal, 0x hex, or 0-prefixed octal), already
-        /// parsed.
+        /// Parsed integer literal (decimal, 0x hex, or 0-prefixed octal).
         int: i64,
-        /// A floating-point literal (HolyC only has F64).
+        /// Float literal (HolyC only has F64).
         float: f64,
-        /// A string literal with escapes already resolved.
+        /// String literal with escapes resolved.
         str: []const u8,
-        /// A character constant. HolyC packs up to 8 chars little-endian into
-        /// an I64, e.g. 'AB' == 0x4241.
+        /// Character constant. Up to 8 chars packed little-endian into an I64,
+        /// e.g. 'AB' == 0x4241.
         char: i64,
-        /// An identifier (not a keyword).
+        /// Identifier (not a keyword).
         ident: []const u8,
-        /// A reserved word or built-in type name.
+        /// Reserved word or built-in type name.
         keyword: Keyword,
 
         // ---- Arithmetic ----
@@ -196,9 +194,9 @@ pub const Token = struct {
 
         pub const Tag = std.meta.Tag(Kind);
 
-        /// A readable spelling of the token kind for diagnostics: a
-        /// descriptive name for the literal/name kinds, and the source symbol
-        /// for operators and punctuation.
+        /// A readable spelling of the token kind for diagnostics: a descriptive
+        /// name for literal/name kinds, the source symbol for operators and
+        /// punctuation.
         pub fn describe(t: Tag) []const u8 {
             return switch (t) {
                 .int => "integer",
@@ -265,7 +263,7 @@ pub const Token = struct {
         return t.kind;
     }
 
-    /// Renders a token with its decoded payload, for debugging.
+    /// Renders a token with its payload, for debugging.
     pub fn format(t: Token, w: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (t.kind) {
             .int => |v| try w.print("Int({d})", .{v}),

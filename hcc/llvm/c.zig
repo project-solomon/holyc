@@ -1,10 +1,10 @@
 //! Handwritten bindings for the subset of the LLVM-C API the backend uses.
-//! Linked against the system libLLVM (see build.zig's -Dllvm-prefix). Kept as
-//! extern declarations rather than @cImport/translate-c: the surface is small,
-//! stable, and this keeps the build free of LLVM header dependencies.
+//! Linked against the system libLLVM (see build.zig's -Dllvm-prefix). Extern
+//! declarations rather than @cImport/translate-c: the surface is small and
+//! stable, and this avoids LLVM header dependencies.
 //!
 //! Naming: types drop the LLVM*Ref suffix (LLVMValueRef → *Value); functions
-//! keep their exact C names so they read like the LLVM-C docs.
+//! keep their exact C names to match the LLVM-C docs.
 
 const std = @import("std");
 
@@ -25,9 +25,9 @@ pub const Bool = c_int;
 
 // ---- version ----
 
-/// Fills in the running libLLVM's version (it links dynamically, so the version
-/// is a runtime property). Used to key the build cache: a libLLVM upgrade can
-/// change codegen even when hcc itself is unchanged.
+/// Fills in the running libLLVM's version (a runtime property, since it links
+/// dynamically). Keys the build cache: a libLLVM upgrade can change codegen
+/// even when hcc is unchanged.
 pub extern fn LLVMGetVersion(major: *c_uint, minor: *c_uint, patch: *c_uint) void;
 
 // ---- context / module / builder ----
@@ -126,7 +126,7 @@ pub extern fn LLVMAddAttributeAtIndex(func: *Value, index: AttributeIndex, attr:
 pub extern fn LLVMAddCallSiteAttribute(call: *Value, index: AttributeIndex, attr: *Attribute) void;
 
 pub const AttributeIndex = c_uint;
-pub const attribute_function_index: AttributeIndex = std.math.maxInt(c_uint); // ~0U
+pub const attribute_function_index: AttributeIndex = std.math.maxInt(c_uint);
 
 // ---- basic blocks & builder positioning ----
 

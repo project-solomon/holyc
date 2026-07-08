@@ -1,12 +1,11 @@
 //! Semantic analysis for HolyC: name resolution, type inference, and validity
 //! checks over the parsed Program.
 //!
-//! HolyC is weakly typed and C-like. The default integer is I64, pointers and
-//! integers convert freely, and comparison and logical results are I64. The
-//! analyzer is permissive about scalar conversions and focuses on catching
-//! genuine mistakes:
+//! HolyC is weakly typed and C-like: default integer I64, pointers and integers
+//! convert freely, comparison and logical results are I64. The analyzer is
+//! permissive about scalar conversions and catches:
 //!
-//!   - use of undeclared variables, unknown types, and unknown fields,
+//!   - undeclared variables, unknown types, unknown fields,
 //!   - redeclaration of variables, parameters, fields, functions, and types,
 //!   - break/case/default used out of context,
 //!   - goto to a label that does not exist in the function,
@@ -14,11 +13,10 @@
 //!   - non-scalar conditions, indexing non-pointers, member access on
 //!     non-aggregates, assigning to non-lvalues, and & of non-lvalues.
 //!
-//! Analysis does not stop at the first error: all errors are collected into
-//! the shared diagnostics, each carrying a source position, and
-//! error.CompileFailed is returned at the end iff any error was recorded. It
-//! annotates each Expr.ty in place. Layout is a separate pass (layout.zig);
-//! sema does not run it.
+//! Errors don't stop the pass: all are collected into the shared diagnostics
+//! with a source position, and error.CompileFailed is returned iff any was
+//! recorded. Annotates each Expr.ty in place. Layout is a separate pass
+//! (layout.zig); sema does not run it.
 
 const std = @import("std");
 const source = @import("source.zig");
@@ -28,10 +26,9 @@ const layout = @import("layout.zig");
 
 const Oom = error{OutOfMemory};
 
-/// Resolves names and type-checks prog, annotating each Expr.ty in place.
-/// The single public entry point for the sema pass. Every error is recorded as
-/// a .sema diagnostic; warnings (sorted by position for deterministic output)
-/// never fail the compilation.
+/// Resolves names and type-checks prog, annotating each Expr.ty in place. The
+/// sema pass's only public entry point. Errors are recorded as .sema
+/// diagnostics; warnings (sorted by position) never fail compilation.
 pub fn check(arena: std.mem.Allocator, diags: *diag.Diagnostics, prog: *ast.Program) diag.Error!void {
     var a = Analyzer{ .arena = arena, .diags = diags };
     try a.run(prog);
@@ -56,8 +53,8 @@ const ktask_ptr: ast.Type = .{ .ptr = &ktask_named };
 
 // ---- analyzer state ----
 
-/// One class/union field, flattened for lookup, keeping its source position
-/// so type-reference errors can point at it.
+/// One class/union field, flattened for lookup, with its source position for
+/// type-reference errors.
 const FieldEntry = struct {
     name: []const u8,
     ty: ast.Type,
@@ -68,22 +65,22 @@ const FieldEntry = struct {
 const TypeDef = struct {
     fields: []const FieldEntry,
     base: []const u8, // "" if none
-    base_pos: source.Pos, // position of the definition, for base-class errors
-    file: u32, // span.file the type was defined in, for file-scoped visibility
+    base_pos: source.Pos, // definition position, for base-class errors
+    file: u32, // defining file, for file-scoped visibility
     is_public: bool,
 };
 
 /// A function signature.
 const FuncSig = struct {
     ret: ast.Type,
-    params: []const ast.Type, // declared parameter types, for &Func function-pointer types
-    has_default: []const bool, // per-parameter: whether it has a default value (any position)
-    required: usize, // parameters that must be supplied (those without a default)
-    total: usize, // total declared parameter count
+    params: []const ast.Type, // declared param types, for &Func function-pointer types
+    has_default: []const bool, // per-param: has a default value (any position)
+    required: usize, // params that must be supplied (no default)
+    total: usize, // total declared param count
     varargs: bool,
-    defined: bool, // whether a definition (not just a prototype) has been seen
-    file: u32, // span.file the function was first declared in
-    is_public: bool, // whether any declaration was marked public
+    defined: bool, // a definition (not just a prototype) has been seen
+    file: u32, // file the function was first declared in
+    is_public: bool, // any declaration was marked public
 };
 
 /// One local variable tracked for the unused-variable warning.
@@ -93,8 +90,8 @@ const VarUse = struct {
     used: bool = false,
 };
 
-/// A warning collected during the pass, appended to the diagnostics sorted by
-/// position once analysis finishes.
+/// A warning collected during the pass, appended (sorted by position) once
+/// analysis finishes.
 const WarnItem = struct {
     file: u32,
     pos: source.Pos,
@@ -110,8 +107,7 @@ const Scope = std.StringArrayHashMapUnmanaged(ast.Type);
 const VarUseMap = std.StringArrayHashMapUnmanaged(VarUse);
 const LabelSet = std.StringArrayHashMapUnmanaged(void);
 
-/// Runs semantic analysis; check is its single public entry point. An
-/// analyzer is single-use.
+/// Runs semantic analysis; check is its entry point. Single-use.
 const Analyzer = struct {
     arena: std.mem.Allocator,
     diags: *diag.Diagnostics,
@@ -133,9 +129,8 @@ const Analyzer = struct {
     in_function: bool = false,
     loop_depth: usize = 0,
     switch_depth: usize = 0,
-    /// The stack of label sets: labels declared directly in the current block
-    /// and each enclosing block. A goto is valid iff its target is in one of
-    /// these.
+    /// Stack of label sets: labels declared directly in the current block and
+    /// each enclosing one. A goto is valid iff its target is in one.
     label_scopes: std.ArrayList(LabelSet) = .empty,
     /// The program's source-file table, for privacy diagnostics.
     files: []const source.FileInfo = &.{},
@@ -149,10 +144,9 @@ const Analyzer = struct {
         try a.scopes.append(a.arena, .empty); // global scope
         try a.var_uses.append(a.arena, .empty); // (globals are never tracked)
         // `envp` is the implicit environment global: U8** (a NULL-terminated
-        // array of "KEY=VALUE" strings). Unlike argc/argv it has a single
-        // meaning, so it is a plain global in scope everywhere. `Fs` is the
-        // current task/thread context, CTask* (it holds the exception state
-        // read inside catch).
+        // array of "KEY=VALUE" strings), in scope everywhere. `Fs` is the
+        // current task/thread context, CTask* (holds the exception state read
+        // inside catch).
         try a.scopes.items[0].put(a.arena, "envp", u8_ptr_ptr);
         try a.scopes.items[0].put(a.arena, "Fs", ktask_ptr);
         try a.collectTypes(prog);
@@ -168,7 +162,7 @@ const Analyzer = struct {
         _ = a.var_uses.pop();
     }
 
-    /// Records a semantic error, without stopping the pass.
+    /// Records a semantic error without stopping the pass.
     fn err(a: *Analyzer, file: u32, pos: source.Pos, comptime fmt: []const u8, args: anytype) Oom!void {
         a.err_count += 1;
         try a.diags.add(.@"error", .sema, file, pos, fmt, args);
@@ -184,8 +178,7 @@ const Analyzer = struct {
     }
 
     /// Marks the named local (innermost match) as referenced, so it won't be
-    /// reported unused. A no-op for names that aren't tracked locals (globals,
-    /// params).
+    /// reported unused. No-op for non-tracked names (globals, params).
     fn markUsed(a: *Analyzer, name: []const u8) void {
         var i = a.var_uses.items.len;
         while (i > 0) {
@@ -235,9 +228,8 @@ const Analyzer = struct {
                     try a.err(item.span.file, item.span.pos, "redefinition of function `{s}`", .{f.name});
                     continue;
                 }
-                // A prototype followed by a definition (or vice versa) is
-                // fine. Mark it defined if either is, and public if any
-                // declaration was public.
+                // Prototype then definition (or vice versa) is fine: defined
+                // if either is, public if any declaration was.
                 existing.defined = existing.defined or has_body;
                 existing.is_public = existing.is_public or f.is_public;
                 continue;
@@ -264,9 +256,9 @@ const Analyzer = struct {
         }
     }
 
-    /// Confirms field and base-class type references exist, after all types
-    /// are registered. Each reference is checked for existence and privacy
-    /// against the file of the class that declares it.
+    /// Confirms field and base-class type references exist, after all types are
+    /// registered. Each is checked for existence and privacy against the file
+    /// of the class that declares it.
     fn validateTypeRefs(a: *Analyzer) Oom!void {
         const Ref = struct { ty: ast.Type, pos: source.Pos, file: u32 };
         const BaseRef = struct { name: []const u8, pos: source.Pos, file: u32 };
@@ -291,9 +283,8 @@ const Analyzer = struct {
         }
     }
 
-    /// Enforces that a public function does not expose a non-public type
-    /// through its return type: a caller in another file could call it but
-    /// couldn't name the result.
+    /// Enforces that a public function doesn't expose a non-public return type:
+    /// a caller in another file could call it but couldn't name the result.
     fn checkPublicSignatures(a: *Analyzer, prog: *const ast.Program) Oom!void {
         for (prog.items) |item| {
             // Compiler-generated functions are trusted.
@@ -309,9 +300,9 @@ const Analyzer = struct {
         }
     }
 
-    /// The name of the first non-public named class/union reachable in ty by
-    /// peeling pointers and arrays, or null if every named component is
-    /// public (or built-in).
+    /// Name of the first non-public named class/union reachable in ty (peeling
+    /// pointers and arrays), or null if every named component is public or
+    /// built-in.
     fn firstPrivateNamed(a: *Analyzer, ty: ast.Type) ?[]const u8 {
         switch (ty) {
             .named => |n| {
@@ -346,8 +337,8 @@ const Analyzer = struct {
     }
 
     /// Declares a variable in the current scope, reporting a redeclaration if
-    /// the name already exists at this level. is_public is meaningful only on
-    /// globals; a public local is an error.
+    /// the name already exists here. is_public is meaningful only on globals; a
+    /// public local is an error.
     fn declare(a: *Analyzer, name: []const u8, ty: ast.Type, pos: source.Pos, file: u32, is_public: bool) Oom!void {
         const is_global = a.scopes.items.len == 1;
         if (is_public and !is_global) {
@@ -376,9 +367,9 @@ const Analyzer = struct {
 
     // ---- type resolution ----
 
-    /// Confirms a type's named parts exist, reporting and continuing
-    /// otherwise. ref_file is the span.file of the site that uses the type,
-    /// so privacy is checked against the exact reference location.
+    /// Confirms a type's named parts exist, reporting and continuing otherwise.
+    /// ref_file is the file of the use site, so privacy is checked against the
+    /// exact reference location.
     fn resolveType(a: *Analyzer, ty: ast.Type, pos: source.Pos, ref_file: u32) Oom!void {
         switch (ty) {
             .named => |n| {
@@ -402,10 +393,10 @@ const Analyzer = struct {
         }
     }
 
-    /// Reports an error for any array dimension of a variable's type that is
-    /// not a compile-time constant. hcc requires constant array sizes: like
-    /// HolyC, it does not support variable-length arrays (`U8 buf[n]` with a
-    /// runtime n). Nested dimensions (`m[3][n]`) are all checked.
+    /// Reports any array dimension of a variable's type that isn't a
+    /// compile-time constant. hcc requires constant array sizes: like HolyC, no
+    /// variable-length arrays (`U8 buf[n]` with runtime n). Nested dimensions
+    /// (`m[3][n]`) are all checked.
     fn checkConstArraySizes(a: *Analyzer, ty: ast.Type) Oom!void {
         var t = ty;
         while (true) {
@@ -429,8 +420,8 @@ const Analyzer = struct {
     // ---- top-level & statements ----
 
     fn checkTopItem(a: *Analyzer, item: *ast.Stmt) Oom!void {
-        // Type references inside this item are checked for file-scoped
-        // visibility against this item's file. A generated item is trusted.
+        // Type references in this item are checked for file-scoped visibility
+        // against this item's file. Generated items are trusted.
         a.cur_file = item.span.file;
         a.in_generated = item.span.file == ast.generated_file;
         switch (item.kind) {
@@ -486,8 +477,8 @@ const Analyzer = struct {
             .empty, .label => {},
             .no_warn => |names| {
                 // `no_warn a, b;` suppresses the unused-variable warning for
-                // the named locals by marking them used. An unknown name is a
-                // mistake, so it is reported.
+                // the named locals by marking them used. Unknown names are
+                // reported.
                 for (names) |name| {
                     if (a.lookupVar(name) == null) {
                         try a.err(stmt.span.file, stmt.span.pos, "unknown variable `{s}` in no_warn", .{name});
@@ -501,10 +492,9 @@ const Analyzer = struct {
                 try a.checkImplicitPrint(e);
             },
             .asm_stmt => |k| {
-                // Validate the architecture and resolve any bare-name
-                // variable operands (marking them used).
-                // Register/immediate/symbol operands and mnemonics are
-                // checked later, by the architecture's assembler.
+                // Validate the architecture and resolve bare-name variable
+                // operands (marking them used). Register/immediate/symbol
+                // operands and mnemonics are checked later by the assembler.
                 if (!ast.isAsmArch(k.arch)) {
                     try a.err(k.arch_span.file, k.arch_span.pos, "unknown asm architecture `{s}` (expected amd64 or arm64)", .{k.arch});
                 }
@@ -625,8 +615,8 @@ const Analyzer = struct {
                 }
             },
             // HolyC functions are top-level only; a nested definition is
-            // rejected outright (a nested class is silently ignored, as it
-            // never reaches the type table).
+            // rejected (a nested class is silently ignored, never reaching the
+            // type table).
             .func_def => {
                 try a.err(stmt.span.file, stmt.span.pos, "nested function definitions are not supported; define the function at the top level", .{});
             },
@@ -645,9 +635,8 @@ const Analyzer = struct {
         }
         try a.declare(d.name, d.ty, d.span.pos, d.span.file, d.is_public);
 
-        // A `reg <REG> x` pin only makes sense for a value that fits a
-        // general-purpose register: an integer or a pointer (not a float,
-        // array, or aggregate).
+        // A `reg <REG> x` pin needs a value that fits a general-purpose
+        // register: an integer or pointer (not a float, array, or aggregate).
         const pinned = d.reg_mode == .reg and d.reg_name.len > 0;
         if (pinned) {
             if (!isInteger(d.ty) and d.ty != .ptr) {
@@ -656,9 +645,9 @@ const Analyzer = struct {
         }
 
         // Track non-global locals in the user's base source (file 0) for the
-        // unused-variable warning; prelude/included/generated declarations are
-        // skipped. A pinned variable is exempt: it is reached by its register
-        // name (e.g. from asm), which the unused-variable analysis cannot see.
+        // unused-variable warning; core/included/generated ones are skipped. A
+        // pinned variable is exempt: it is reached by its register name (e.g.
+        // from asm), which the analysis cannot see.
         if (a.scopes.items.len > 1 and d.span.file == 0 and !pinned) {
             try a.var_uses.items[a.var_uses.items.len - 1].put(a.arena, d.name, .{ .pos = d.span.pos, .file = d.span.file });
         }
@@ -934,9 +923,8 @@ const Analyzer = struct {
     fn checkIdent(a: *Analyzer, name: []const u8, span: source.Span) Oom!ast.Type {
         a.markUsed(name); // referencing a local (read or write) clears its unused warning
         if (a.lookupVar(name)) |t| {
-            // If the name resolves to a global not shadowed by a local,
-            // enforce file-scoped visibility like a function or type
-            // reference.
+            // A global not shadowed by a local gets file-scoped visibility,
+            // like a function or type reference.
             var shadowed = false;
             var i: usize = 1;
             while (i < a.scopes.items.len) : (i += 1) {
@@ -994,10 +982,9 @@ const Analyzer = struct {
                 const d = decay(t);
                 switch (d) {
                     .ptr => |elem| return elem.*,
-                    // Dereferencing a function pointer yields the same
-                    // function pointer: the function "lvalue" decays straight
-                    // back, so *fp, **fp, … all stay callable. This makes the
-                    // explicit-deref call form (*fp)(x) work like fp(x).
+                    // Dereferencing a function pointer yields the same function
+                    // pointer, so *fp, **fp, … stay callable and (*fp)(x) works
+                    // like fp(x).
                     .func_ptr => return d,
                     else => {},
                 }
@@ -1005,9 +992,8 @@ const Analyzer = struct {
                 return prim_i64;
             },
             .addr_of => {
-                // &Func is a function pointer: a function is addressable
-                // though not an lvalue. A local variable shadows a function
-                // of the same name.
+                // &Func is a function pointer: a function is addressable though
+                // not an lvalue. A local shadows a function of the same name.
                 switch (inner.kind) {
                     .ident => |name| {
                         if (a.lookupVar(name) == null) {
@@ -1048,10 +1034,9 @@ const Analyzer = struct {
                 if (op == .sub and isPointer(lt) and isPointer(rt)) {
                     return prim_i64;
                 }
-                // Pointer +/- integer is C-style scaled pointer arithmetic
-                // and keeps the pointer type, so *(p + i) and (p + i)[j]
-                // work; the lowerer scales the integer operand by the element
-                // size.
+                // Pointer +/- integer is C-style scaled arithmetic and keeps
+                // the pointer type; the lowerer scales the integer operand by
+                // the element size.
                 if ((op == .add or op == .sub) and isPointer(lt) and isInteger(rt)) {
                     return lt;
                 }
@@ -1123,8 +1108,8 @@ const Analyzer = struct {
         for (args, 0..) |arg, i| {
             arg_types[i] = if (arg) |e| try a.checkExpr(e) else null;
         }
-        // A direct call to a named function or builtin, unless a local
-        // variable of the same name shadows it.
+        // A direct call to a named function or builtin, unless a local of the
+        // same name shadows it.
         direct: {
             const name = switch (callee.kind) {
                 .ident => |name| name,
@@ -1139,10 +1124,10 @@ const Analyzer = struct {
             if (!sig.varargs and argc > sig.total) {
                 try a.err(callee.span.file, callee.span.pos, "function `{s}` expects at most {d} argument(s), got {d}", .{ name, sig.total, argc });
             }
-            // Per-position: a supplied argument is type-checked against its
+            // Per-position: a supplied argument is checked against its
             // parameter; a skipped (`F(,x)`) or omitted-trailing position must
-            // have a default. This makes defaults usable in any position
-            // (HolyC), not just trailing ones.
+            // have a default. Defaults work in any position (HolyC), not just
+            // trailing ones.
             var i: usize = 0;
             while (i < sig.total) : (i += 1) {
                 const supplied = i < argc and args[i] != null;
@@ -1165,8 +1150,7 @@ const Analyzer = struct {
             return sig.ret;
         }
         // Otherwise the callee is a value that must be a function pointer.
-        // Function pointers have no default arguments, so a skipped slot is
-        // an error.
+        // Function pointers have no defaults, so a skipped slot is an error.
         switch (decay(try a.checkExpr(callee))) {
             .func_ptr => |fp| {
                 if (argc != fp.params.len) {
@@ -1205,11 +1189,11 @@ const Analyzer = struct {
         }
     }
 
-    /// Verifies a Print-style format against its arguments. It runs only when
-    /// the format is a string literal in the user's base source (a runtime
-    /// format can't be analyzed, and prelude/included calls aren't the user's
-    /// concern), and warns on argument-count mismatches, argument-type
-    /// mismatches, and unknown conversions.
+    /// Verifies a Print-style format against its arguments. Runs only when the
+    /// format is a string literal in the user's base source (a runtime format
+    /// can't be analyzed, and core/included calls aren't the user's concern).
+    /// Warns on argument-count and argument-type mismatches and unknown
+    /// conversions.
     fn checkPrintFormat(a: *Analyzer, fmt_expr: ?*ast.Expr, args: []const ?*ast.Expr) Oom!void {
         const fe = fmt_expr orelse return;
         if (fe.span.file != 0) return;
@@ -1238,9 +1222,9 @@ const Analyzer = struct {
     }
 
     /// Warns when an argument's type clearly disagrees with its conversion.
-    /// It is lenient because HolyC converts freely, so it flags only definite
-    /// mismatches: a float spec with a non-float, an integer spec with a
-    /// float, and `%s` with a non-pointer.
+    /// Lenient because HolyC converts freely: flags only definite mismatches
+    /// (a float spec with a non-float, an integer spec with a float, `%s` with
+    /// a non-pointer).
     fn checkPrintArgType(a: *Analyzer, conv: u8, arg_ty: ?ast.Type, span: source.Span) Oom!void {
         const raw = arg_ty orelse return;
         const t = decay(raw);
@@ -1300,10 +1284,10 @@ const Analyzer = struct {
     }
 
     /// Warns when a constant index is out of bounds for a fixed-size array.
-    /// It applies only when base_ty is a genuine array (not a decayed
-    /// pointer) with a constant dimension and the index folds to a constant.
-    /// It never false-warns on dynamic indices, pointers, or sizes it cannot
-    /// evaluate before layout.
+    /// Applies only when base_ty is a genuine array (not a decayed pointer)
+    /// with a constant dimension and the index folds to a constant. Never
+    /// false-warns on dynamic indices, pointers, or sizes it can't evaluate
+    /// before layout.
     fn checkIndexBounds(a: *Analyzer, base_ty: ast.Type, index: *ast.Expr) Oom!void {
         if (index.span.file != 0) return;
         const arr = switch (base_ty) {
@@ -1420,9 +1404,8 @@ const Analyzer = struct {
         }
     }
 
-    /// Reports an error if a value of type `from` may not be assigned to a
-    /// slot of type `to`. Permissive for scalars; strict only about aggregate
-    /// mismatches.
+    /// Reports an error if type `from` can't be assigned to a slot of type
+    /// `to`. Permissive for scalars; strict only about aggregate mismatches.
     fn checkAssignable(a: *Analyzer, to: ast.Type, from: ast.Type, span: source.Span) Oom!void {
         const td = decay(to);
         const fd = decay(from);
@@ -1439,8 +1422,8 @@ const Analyzer = struct {
     }
 
     /// Type-checks a brace-delimited statement list in its own label and
-    /// variable scope: labels declared directly in stmts become goto targets
-    /// for its duration, and locals declared inside do not leak out.
+    /// variable scope: labels declared directly in stmts are goto targets for
+    /// its duration, and locals inside don't leak out.
     fn checkScopedBlock(a: *Analyzer, stmts: []const *ast.Stmt) Oom!void {
         try a.label_scopes.append(a.arena, try a.directLabels(stmts));
         try a.pushScope();
@@ -1451,9 +1434,9 @@ const Analyzer = struct {
         _ = a.label_scopes.pop();
     }
 
-    /// The set of labels declared directly in a statement list (one level
-    /// deep, not inside nested blocks). A goto can target these from anywhere
-    /// within the block or a nested block.
+    /// Labels declared directly in a statement list (one level deep, not in
+    /// nested blocks). A goto can target these from anywhere within the block
+    /// or a nested block.
     fn directLabels(a: *Analyzer, stmts: []const *ast.Stmt) Oom!LabelSet {
         var out: LabelSet = .empty;
         for (stmts) |s| {
@@ -1469,7 +1452,7 @@ const Analyzer = struct {
 // ---- free helpers (HolyC's weak-typing rules) ----
 
 /// Whether t is a zero-size void type. U0 and I0 are the unsigned and signed
-/// zero-width types; the sign is meaningless at zero bits, so they are
+/// zero-width types; the sign is meaningless at zero bits, so they're
 /// interchangeable.
 pub fn isVoid(t: ast.Type) bool {
     return t.isPrim(.U0) or t.isPrim(.I0);
@@ -1582,10 +1565,10 @@ fn isInitLike(e: *const ast.Expr) bool {
     };
 }
 
-/// Structurally reports whether e is a constant array-size expression.
-/// sizeof/offset are constant even when their value can't be folded before
-/// layout (so `buf[sizeof(SomeClass)]` is accepted), which a value-folder
-/// alone would reject.
+/// Whether e is structurally a constant array-size expression. sizeof/offset
+/// count as constant even when their value can't be folded before layout (so
+/// `buf[sizeof(SomeClass)]` is accepted), which a value-folder alone would
+/// reject.
 fn isConstSizeExpr(e: *const ast.Expr) bool {
     return switch (e.kind) {
         .int_lit, .char_lit, .sizeof, .offset => true,

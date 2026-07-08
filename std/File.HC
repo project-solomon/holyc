@@ -1,11 +1,11 @@
 // File.HC — file-descriptor I/O and filesystem mutation on the host OS.
 // `#include <File.HC>`.
 //
-// Not TempleOS-native (TempleOS is a single-address-space machine with no
-// POSIX fds): this is the compiler's real-OS target layer. Compiler intrinsics
-// — the prototypes put the names in scope for the type-checker and each call
-// lowers directly to the libc equivalent (Open translates Linux-style flags on
-// darwin), so no bodies exist. A host service, not part of the dialect core.
+// Not TempleOS-native (TempleOS is single-address-space with no POSIX fds):
+// this is the compiler's real-OS target layer. Compiler intrinsics; the
+// prototypes put the names in scope for the type-checker and each call lowers
+// to the libc equivalent (Open translates Linux-style flags on darwin), so no
+// bodies exist. A host service, not part of the dialect core.
 #ifndef __STD_FILE_HC
 #define __STD_FILE_HC
 

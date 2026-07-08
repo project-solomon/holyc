@@ -1,9 +1,9 @@
 // Net.HC — host TCP sockets (no TempleOS analog). `#include <Net.HC>`.
 //
-// Compiler intrinsics; see <File.HC> for the intrinsic conventions. Read/Write
-// (from <File.HC>) work on connected socket fds. The caller builds sockaddr
-// bytes itself (layouts differ per OS — see the __APPLE__ target macro), as
-// does byte-order conversion. A host service, not part of the dialect core.
+// Compiler intrinsics; see <File.HC> for the conventions. Read/Write (from
+// <File.HC>) work on connected socket fds. The caller builds sockaddr bytes
+// itself (layouts differ per OS; see the __APPLE__ target macro), as does
+// byte-order conversion. A host service, not part of the dialect core.
 #ifndef __STD_NET_HC
 #define __STD_NET_HC
 

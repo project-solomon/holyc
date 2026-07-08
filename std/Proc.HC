@@ -1,10 +1,10 @@
 // Proc.HC — host process control and identity. `#include <Proc.HC>`.
 //
 // Compiler intrinsics: the prototypes put the names in scope for the
-// type-checker and the compiler lowers each call directly to the libc
-// equivalent, so no bodies exist. A host service, not part of the dialect core
-// — a program that terminates by returning from its top level needs none of
-// this; Exit is only for an explicit exit code or to run AtExit handlers.
+// type-checker and the compiler lowers each call to the libc equivalent, so no
+// bodies exist. A host service, not part of the dialect core: a program that
+// terminates by returning from its top level needs none of this; Exit is only
+// for an explicit exit code or to run AtExit handlers.
 #ifndef __STD_PROC_HC
 #define __STD_PROC_HC
 

@@ -1,8 +1,7 @@
 //! Compilation diagnostics. Zig errors carry no payload, so every pass reports
-//! through a shared `Diagnostics` list and returns `error.CompileFailed`: the
-//! lexer, preprocessor, and parser stop at their first error; sema and layout
-//! collect as many as they can before failing at the end. Warnings never fail
-//! a compilation.
+//! through a shared `Diagnostics` list and returns `error.CompileFailed`. Lexer,
+//! preprocessor, and parser stop at the first error; sema and layout collect as
+//! many as they can before failing at the end. Warnings never fail a compile.
 
 const std = @import("std");
 const source = @import("source.zig");
@@ -23,8 +22,8 @@ pub const Diagnostic = struct {
 
 pub const Error = error{ CompileFailed, OutOfMemory };
 
-/// The append-only diagnostics sink for one compilation. Messages are
-/// formatted into the compilation arena.
+/// Append-only diagnostics sink for one compilation. Messages are formatted
+/// into the compilation arena.
 pub const Diagnostics = struct {
     arena: std.mem.Allocator,
     list: std.ArrayList(Diagnostic) = .empty,
@@ -33,8 +32,8 @@ pub const Diagnostics = struct {
         return .{ .arena = arena };
     }
 
-    /// Records an error and returns `error.CompileFailed`, so a first-error
-    /// pass can `return diags.fail(...)` in one step.
+    /// Records an error and returns `error.CompileFailed`, so a first-error pass
+    /// can `return diags.fail(...)` in one step.
     pub fn fail(
         d: *Diagnostics,
         stage: Stage,

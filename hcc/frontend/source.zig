@@ -3,7 +3,7 @@
 
 const std = @import("std");
 
-/// A position in a source file. Line and col are 1-based, for error messages.
+/// A position in a source file. Line and col are 1-based.
 pub const Pos = struct {
     line: u32 = 1,
     col: u32 = 1,
@@ -13,15 +13,15 @@ pub const Pos = struct {
     }
 };
 
-/// A half-open span [start, end) of byte offsets into a source file, paired
-/// with the start position for diagnostics.
+/// A half-open span [start, end) of byte offsets into a source file, with the
+/// start position for diagnostics.
 pub const Span = struct {
     start: usize = 0,
     end: usize = 0,
     pos: Pos = .{},
     /// Indexes the program's file table: which source file this span came from.
-    /// The lexer leaves it 0 (the root/top-level source); the preprocessor
-    /// stamps the real id onto every token it emits from an #include frame.
+    /// The lexer leaves it 0 (root/top-level source); the preprocessor stamps
+    /// the real id onto every token it emits from an #include frame.
     file: u32 = 0,
 
     pub fn format(s: Span, w: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -31,10 +31,10 @@ pub const Span = struct {
 
 /// Identifies a source file for diagnostics and `_`-privacy.
 pub const FileInfo = struct {
-    /// The file's directory components (no filename). Two files share
-    /// visibility of non-public symbols iff their dirs are equal.
+    /// Directory components (no filename). Two files share visibility of
+    /// non-public symbols iff their dirs are equal.
     dir: []const []const u8 = &.{},
-    /// The file's own name (empty for the top-level source), for diagnostics.
+    /// The file's name (empty for the top-level source), for diagnostics.
     name: []const u8 = "",
 
     pub fn format(fi: FileInfo, w: *std.Io.Writer) std.Io.Writer.Error!void {

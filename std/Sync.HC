@@ -4,10 +4,10 @@
 // Compiler intrinsics: the prototypes put the names in scope for the
 // type-checker and the compiler lowers each call onto pthreads / the matching
 // atomic instruction (futexes to the host's wait/wake), so no bodies exist.
-// Together with the `lock { … }` block (a language construct whose
-// read-modify-write operations compile to atomic instructions on their own,
-// needing nothing from this file), this is the synchronization vocabulary for
-// Thread()-spawned threads. A host service, not part of the dialect core.
+// With the `lock { … }` block (a language construct whose read-modify-write
+// operations compile to atomic instructions on their own, needing nothing from
+// this file), this is the synchronization vocabulary for Thread()-spawned
+// threads. A host service, not part of the dialect core.
 #ifndef __STD_SYNC_HC
 #define __STD_SYNC_HC
 

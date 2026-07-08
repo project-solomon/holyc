@@ -1,10 +1,10 @@
 //! The HolyC language server: JSON-RPC 2.0 over LSP base-protocol framing,
-//! driven by the hcc compiler front end (without its LLVM backend).
+//! driven by the hcc front end (without its LLVM backend).
 //!
 //! The transport is abstract: the server reads frames from any *std.Io.Reader
 //! and writes to any *std.Io.Writer, so main.zig binds it to stdin/stdout and
-//! tests bind it to in-memory streams. Nothing but protocol frames is written
-//! to `out`; logging goes to stderr.
+//! tests to in-memory streams. Only protocol frames go to `out`; logs go to
+//! stderr.
 //!
 //! Protocol subset (mirrored in the initialize capabilities):
 //!   - textDocumentSync = 1 (full): every didChange replaces the whole text.
@@ -20,26 +20,22 @@ const framing = @import("framing.zig");
 const uri_util = @import("uri.zig");
 const position = @import("position.zig");
 const nav = @import("nav.zig");
-const mod = @import("mod");
 
 gpa: std.mem.Allocator,
 io: std.Io,
 in: *std.Io.Reader,
 out: *std.Io.Writer,
-/// Ordered angle-bracket #include <...> search path (HCC_PATH/pkg, HCC_ROOT/std),
-/// so analysis resolves standard-library and package includes like hcc.
-/// Set by main after init; empty means std/pkg includes will not resolve.
+/// Ordered #include <...> search path (HCC_ROOT/pkg, HCC_ROOT/std), so analysis
+/// resolves standard-library and package includes like hcc. Set by main after
+/// init; empty means std/pkg includes won't resolve.
 include_path: []const []const u8 = &.{},
-/// The third-party package root ($HCC_PATH/pkg), where remote hcc.toml
-/// dependencies are cloned. Set by main; used to resolve alias includes.
-pkg_dir: ?[]const u8 = null,
 /// uri → open document. Keys and texts are gpa-owned.
 docs: std.StringArrayHashMapUnmanaged(Document) = .empty,
-/// Directory the embedded prelude is extracted into (`<HCC_ROOT>/.cache/core`)
+/// Directory the embedded core is extracted into (`<HCC_ROOT>/.cache/core`)
 /// so go-to-definition can jump into it. gpa-owned; set by main. Null disables
-/// go-to-definition into the prelude.
+/// go-to-definition into the core.
 core_cache_dir: ?[]const u8 = null,
-/// Whether the prelude has been written to core_cache_dir this session.
+/// Whether the core has been written to core_cache_dir this session.
 core_extracted: bool = false,
 /// The workspace root path (gpa-owned), or null in single-file mode. When set,
 /// the server scans it for HolyC files and maintains ws_defs for cross-file
@@ -87,9 +83,12 @@ const Analysis = struct {
     src: []const u8,
     program: hcc.ast.Program,
     /// The source-file table (indexed by span.file), arena-owned. Maps a
-    /// non-zero file id (the prelude and #includes) to its FileInfo, so
+    /// non-zero file id (the core and #includes) to its FileInfo, so
     /// go-to-definition can resolve a declaration back to its origin file.
     files: []const hcc.source.FileInfo,
+    /// Every macro and its #define site (arena-owned), so go-to-definition can
+    /// jump from a macro use to its definition.
+    macros: []const hcc.Preprocessor.MacroDef,
 
     fn deinit(a: Analysis, gpa: std.mem.Allocator) void {
         a.arena.deinit();
@@ -444,28 +443,18 @@ fn upsertText(s: *Server, uri: []const u8, text: []const u8) error{OutOfMemory}!
     return s.docs.getPtr(uri_copy).?;
 }
 
-/// Builds the ordered angle-bracket #include <...> search path: $HCC_PATH/pkg
-/// (third-party packages) then $HCC_ROOT/std (the standard library), the same
-/// resolution hcc uses minus the compiler's -I dirs. HCC_ROOT defaults to the
-/// parent of the running binary's directory (so bin/holyc-lsp yields the
-/// toolchain root beside bin/std), and HCC_PATH defaults to HCC_ROOT. Both env
-/// vars override; an unresolvable root is skipped. `env` is anything with a
-/// `get(key) ?[]const u8` (the process environment map).
+/// Builds the #include <...> search path: $HCC_ROOT/pkg (third-party packages)
+/// then $HCC_ROOT/std (standard library), the same resolution hcc uses minus
+/// the -I dirs. HCC_ROOT defaults to the parent of the running binary's dir
+/// (bin/holyc-lsp yields the root beside bin/std); an unresolvable root is
+/// skipped. `env` is anything with `get(key) ?[]const u8` (the environment map).
 pub fn computeIncludePath(arena: std.mem.Allocator, io: std.Io, env: anytype) error{OutOfMemory}![]const []const u8 {
     var path: std.ArrayList([]const u8) = .empty;
-    const hcc_root = resolveRoot(arena, io, env);
-    const hcc_path: ?[]const u8 = env.get("HCC_PATH") orelse hcc_root;
-    if (hcc_path) |hp| try path.append(arena, try std.fs.path.join(arena, &.{ hp, "pkg" }));
-    if (hcc_root) |hr| try path.append(arena, try std.fs.path.join(arena, &.{ hr, "std" }));
+    if (resolveRoot(arena, io, env)) |root| {
+        try path.append(arena, try std.fs.path.join(arena, &.{ root, "pkg" }));
+        try path.append(arena, try std.fs.path.join(arena, &.{ root, "std" }));
+    }
     return path.items;
-}
-
-/// The third-party package root ($HCC_PATH/pkg, HCC_PATH defaulting to the
-/// toolchain root), where remote hcc.toml dependencies are cloned. Null when the
-/// root cannot be resolved.
-pub fn pkgDir(arena: std.mem.Allocator, io: std.Io, env: anytype) ?[]const u8 {
-    const hcc_path = env.get("HCC_PATH") orelse resolveRoot(arena, io, env) orelse return null;
-    return std.fs.path.join(arena, &.{ hcc_path, "pkg" }) catch null;
 }
 
 /// The toolchain root: $HCC_ROOT, else the parent of the running binary's
@@ -477,7 +466,7 @@ fn resolveRoot(arena: std.mem.Allocator, io: std.Io, env: anytype) ?[]const u8 {
     };
 }
 
-/// Where to extract the embedded prelude for go-to-definition into it:
+/// Where to extract the embedded core for go-to-definition into it:
 /// `<HCC_ROOT>/.cache/core`. Returned gpa-owned (lives for the server), or null
 /// when the root cannot be resolved. Set onto `core_cache_dir` by main.
 pub fn coreCacheDir(gpa: std.mem.Allocator, io: std.Io, env: anytype) ?[]u8 {
@@ -487,69 +476,6 @@ pub fn coreCacheDir(gpa: std.mem.Allocator, io: std.Io, env: anytype) ?[]u8 {
     const root = resolveRoot(a, io, env) orelse return null;
     const dir = std.fs.path.join(a, &.{ root, ".cache", "core" }) catch return null;
     return gpa.dupe(u8, dir) catch null;
-}
-
-const FoundManifest = struct { path: []const u8, bytes: []const u8 };
-
-/// Finds the nearest hcc.toml walking up from `start_dir`.
-fn findManifest(io: std.Io, arena: std.mem.Allocator, start_dir: []const u8) !?FoundManifest {
-    var dir: []const u8 = std.Io.Dir.cwd().realPathFileAlloc(io, start_dir, arena) catch return null;
-    while (true) {
-        const cand = try std.fs.path.join(arena, &.{ dir, mod.file_name });
-        if (std.Io.Dir.cwd().readFileAlloc(io, cand, arena, .limited(1 << 20))) |bytes| {
-            return .{ .path = cand, .bytes = bytes };
-        } else |e| if (e == error.OutOfMemory) return error.OutOfMemory;
-        const parent = std.fs.path.dirname(dir) orelse break;
-        if (std.mem.eql(u8, parent, dir)) break;
-        dir = parent;
-    }
-    return null;
-}
-
-/// The include alias map for a document: the nearest hcc.toml's dependencies,
-/// each mapped to its absolute directory under the alias its own `name`'s last
-/// segment gives (or an `as` override). Matches how the compiler resolves module
-/// aliases, so `#include <json/File.HC>` analyzes without a false error. Empty
-/// when there is no manifest.
-fn aliasesFor(s: *Server, arena: std.mem.Allocator, base_dir: []const u8) !std.StringHashMapUnmanaged([]const u8) {
-    var map: std.StringHashMapUnmanaged([]const u8) = .empty;
-    const found = (try findManifest(s.io, arena, base_dir)) orelse return map;
-    var visited: std.StringHashMapUnmanaged(void) = .empty;
-    try s.mergeNames(arena, &map, &visited, found.path, found.bytes);
-    return map;
-}
-
-fn mergeNames(
-    s: *Server,
-    arena: std.mem.Allocator,
-    map: *std.StringHashMapUnmanaged([]const u8),
-    visited: *std.StringHashMapUnmanaged(void),
-    manifest_path: []const u8,
-    bytes: []const u8,
-) Error!void {
-    const dir = std.fs.path.dirname(manifest_path) orelse ".";
-    const manifest = try mod.parse(arena, bytes);
-    for (manifest.deps) |d| {
-        var depdir: []const u8 = undefined;
-        if (d.git) |g| {
-            const pkg = s.pkg_dir orelse continue;
-            depdir = try std.fs.path.join(arena, &.{ pkg, g });
-        } else if (d.path) |p| {
-            const joined = if (std.fs.path.isAbsolute(p)) p else try std.fs.path.join(arena, &.{ dir, p });
-            depdir = std.Io.Dir.cwd().realPathFileAlloc(s.io, joined, arena) catch joined;
-        } else continue;
-
-        const sub = try std.fs.path.join(arena, &.{ depdir, mod.file_name });
-        const sub_bytes: ?[]const u8 = if (std.Io.Dir.cwd().readFileAlloc(s.io, sub, arena, .limited(1 << 20))) |b|
-            b
-        else |e| if (e == error.OutOfMemory) return error.OutOfMemory else null;
-        const own_name: ?[]const u8 = if (sub_bytes) |sb| (try mod.parse(arena, sb)).name else null;
-        const alias = d.as_ orelse mod.defaultAlias(own_name orelse d.source());
-        const gop = try map.getOrPut(arena, alias);
-        if (!gop.found_existing) gop.value_ptr.* = depdir;
-        if ((try visited.getOrPut(arena, depdir)).found_existing) continue;
-        if (sub_bytes) |sb| try s.mergeNames(arena, map, visited, sub, sb);
-    }
 }
 
 // ---- analysis and diagnostics ----
@@ -580,16 +506,15 @@ fn analyzeAndPublish(s: *Server, uri: []const u8, doc: *Document) Error!void {
 
     var diags = hcc.diag.Diagnostics.init(arena);
     var files: []const hcc.source.FileInfo = &.{};
-    // No exe_runner is passed: running an #exe block needs the LLVM backend,
-    // which the server never links. The frontend skips #exe blocks when no
-    // executor is present, so a file using #exe still analyzes (its
-    // compile-time-generated code is not visible to the editor).
+    // No exe_runner: running an #exe block needs the LLVM backend, which the
+    // server never links. The frontend skips #exe blocks without an executor,
+    // so a file using #exe still analyzes (its generated code is not visible to
+    // the editor).
     const result: ?hcc.frontend.Result = hcc.frontend.run(arena, &diags, s.io, src, .{
         .base_dir = base_dir,
         .target = hcc.target.Target.host(),
-        .inject_prelude = true,
+        .inject_core = true,
         .include_path = s.include_path,
-        .aliases = try s.aliasesFor(arena, base_dir),
         .files_out = &files,
     }) catch |e| switch (e) {
         error.CompileFailed => null,
@@ -600,7 +525,7 @@ fn analyzeAndPublish(s: *Server, uri: []const u8, doc: *Document) Error!void {
 
     if (result) |res| {
         if (doc.analysis) |old| old.deinit(s.gpa);
-        doc.analysis = .{ .arena = arena_ptr, .src = src, .program = res.program, .files = files };
+        doc.analysis = .{ .arena = arena_ptr, .src = src, .program = res.program, .files = files, .macros = res.macros };
         keep = true;
         // Keep the cross-file index in step with the live buffer (best-effort:
         // an index-update OOM must not fail the diagnostics publish).
@@ -628,7 +553,7 @@ fn publishDiagnostics(
     try m.jw.beginArray();
     for (diagnostics) |d| {
         // Diagnostics from the open buffer (file 0) map to their position;
-        // ones from includes or the prelude land at 0:0 with the origin file
+        // ones from includes or the core land at 0:0 with the origin file
         // named in the message.
         var pos: position.Position = .{ .line = 0, .character = 0 };
         var message = d.message;
@@ -716,9 +641,8 @@ fn wsIndexPath(s: *Server, abs_path: []const u8) Error!void {
     const res = hcc.frontend.run(tmp, &diags, s.io, src, .{
         .base_dir = base_dir,
         .target = hcc.target.Target.host(),
-        .inject_prelude = true,
+        .inject_core = true,
         .include_path = s.include_path,
-        .aliases = s.aliasesFor(tmp, base_dir) catch .empty,
     }) catch return;
 
     const uri = try nav.pathToUri(s.gpa, abs_path);
@@ -790,10 +714,10 @@ fn writeLoc(jw: *std.json.Stringify, uri: []const u8, range: nav.Range) error{Wr
     try jw.endObject();
 }
 
-/// Extracts the embedded prelude to core_cache_dir once per session, so a
-/// go-to-definition into the prelude has a real file to point at. Returns the
+/// Extracts the embedded core to core_cache_dir once per session, so a
+/// go-to-definition into the core has a real file to point at. Returns the
 /// directory on success, or null when disabled (no cache dir) or the write
-/// fails, in which case prelude navigation is skipped. Overwrites each session
+/// fails, in which case core navigation is skipped. Overwrites each session
 /// so the cache always matches this binary's embedded core.
 fn ensureCoreExtracted(s: *Server) ?[]const u8 {
     const dir = s.core_cache_dir orelse return null;
@@ -811,7 +735,7 @@ fn ensureCoreExtracted(s: *Server) ?[]const u8 {
 }
 
 /// Answers go-to-definition. A declaration in the same file wins (precise, and
-/// reflecting unsaved edits); then the embedded prelude (jumping into an
+/// reflecting unsaved edits); then the embedded core (jumping into an
 /// extracted copy of its source); otherwise the workspace index is consulted so
 /// the jump can cross files. Replies null when the cursor is already on the
 /// declaration (so the editor falls back to find-all-references) or when there
@@ -845,8 +769,8 @@ fn replyDefinition(s: *Server, id: std.json.Value, params: std.json.Value) Error
             try writeLoc(&m.jw, uri, nav.rangeFromOffsets(analysis.src, off));
             return s.send(&m);
         }
-        // Then the embedded prelude: jump into an extracted copy of its source.
-        if (nav.findPreludeDef(analysis.program.items, analysis.files, word)) |pd| {
+        // Then the embedded core: jump into an extracted copy of its source.
+        if (nav.findCoreDef(analysis.program.items, analysis.files, word)) |pd| {
             if (s.ensureCoreExtracted()) |dir| {
                 var sa = std.heap.ArenaAllocator.init(s.gpa);
                 defer sa.deinit();
@@ -859,6 +783,39 @@ fn replyDefinition(s: *Server, id: std.json.Value, params: std.json.Value) Error
                 try writeLoc(&m.jw, loc_uri, pd.range);
                 return s.send(&m);
             }
+        }
+        // Then a macro (#define): jump from a use to its definition site. The
+        // def span is the macro name itself; resolve its file the same way as a
+        // core declaration (the user's own file, or the extracted core).
+        for (analysis.macros) |md| {
+            if (!std.mem.eql(u8, md.name, word))
+                continue;
+            const off = nav.Offsets{ .start = md.def.start, .end = md.def.end };
+            if (md.def.file == 0) {
+                var m = s.beginMessage();
+                defer m.deinit();
+                try m.beginResponse(id);
+                try writeLoc(&m.jw, uri, nav.rangeFromOffsets(analysis.src, off));
+                return s.send(&m);
+            }
+            if (md.def.file < analysis.files.len) {
+                const core_name = analysis.files[md.def.file].name;
+                if (hcc.core.get(core_name)) |ctext| {
+                    if (s.ensureCoreExtracted()) |dir| {
+                        var sa = std.heap.ArenaAllocator.init(s.gpa);
+                        defer sa.deinit();
+                        const a = sa.allocator();
+                        const path = try std.fs.path.join(a, &.{ dir, core_name });
+                        const loc_uri = try nav.pathToUri(a, path);
+                        var m = s.beginMessage();
+                        defer m.deinit();
+                        try m.beginResponse(id);
+                        try writeLoc(&m.jw, loc_uri, nav.rangeFromOffsets(ctext, off));
+                        return s.send(&m);
+                    }
+                }
+            }
+            break; // matched the macro name but its location is unresolvable
         }
     }
 
@@ -975,7 +932,7 @@ fn replyDocumentSymbol(s: *Server, id: std.json.Value, params: std.json.Value) E
     try m.beginResponse(id);
     try m.jw.beginArray();
     for (analysis.program.items) |item| {
-        // The buffer's own items only: the prelude and includes are file != 0.
+        // The buffer's own items only: the core and includes are file != 0.
         if (item.span.file != 0) continue;
         switch (item.kind) {
             .func_def => |f| {
@@ -1083,11 +1040,11 @@ fn replyHover(s: *Server, id: std.json.Value, params: std.json.Value) Error!void
         .ident => |name| try std.fmt.allocPrint(scratch, "{s}: {s}", .{ name, ty_str }),
         else => ty_str,
     };
-    // Annotate when the symbol under the cursor is declared in the implicit prelude.
+    // Annotate when the symbol under the cursor is declared in the implicit core.
     var origin: []const u8 = "";
     if (expr.kind == .ident) {
-        if (nav.findPreludeDef(analysis.program.items, analysis.files, expr.kind.ident)) |pd|
-            origin = try std.fmt.allocPrint(scratch, "\n\n*from `{s}` (prelude)*", .{pd.core_name});
+        if (nav.findCoreDef(analysis.program.items, analysis.files, expr.kind.ident)) |pd|
+            origin = try std.fmt.allocPrint(scratch, "\n\n*from `{s}` (core)*", .{pd.core_name});
     }
     const value = try std.fmt.allocPrint(scratch, "```holyc\n{s}\n```{s}", .{ text, origin });
 

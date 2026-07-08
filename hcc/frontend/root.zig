@@ -1,7 +1,7 @@
 //! The HolyC compiler front end as a reusable module: lex, preprocess, parse,
-//! reflect, check, layout. The `hcc` CLI drives it and hands the checked
-//! program to the `llvm` backend module; the language server and the
-//! integration harness consume it directly. Links nothing (no LLVM).
+//! reflect, check, layout. The `hcc` CLI drives it and hands the checked program
+//! to the `llvm` backend module; the language server and the integration harness
+//! consume it directly. Links nothing (no LLVM).
 
 pub const source = @import("source.zig");
 pub const diag = @import("diag.zig");

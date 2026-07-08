@@ -1,12 +1,11 @@
-//! The benchmark harness: a standalone driver with no code dependency on the
-//! compiler. It invokes the installed `hcc` from the PATH (run install.sh to
-//! build and install it) and `clang`. Each case in the benchmarks directory
-//! is a `<stem>.HC` / `<stem>.c` pair implementing the same workload; the
-//! harness compiles the HolyC side with hcc and the C side with clang at every
-//! optimization level, then reports the target (the host; neither compiler
-//! cross-compiles) and two tables of mean wall-clock times, one for execution
-//! and one for compilation. Ratios are hcc/clang (above 1.00x, hcc is slower).
-//! Outputs are not compared; this is a timing comparison only.
+//! Benchmark harness: standalone driver, no code dependency on the compiler.
+//! Invokes the installed `hcc` from PATH (run install.sh) and `clang`. Each
+//! case in the benchmarks directory is a `<stem>.HC` / `<stem>.c` pair of the
+//! same workload; compiles the HolyC side with hcc and the C side with clang
+//! at every optimization level, then reports the target (the host; neither
+//! compiler cross-compiles) and two tables of mean wall-clock times, one for
+//! execution and one for compilation. Ratios are hcc/clang (above 1.00x, hcc
+//! is slower). Outputs are not compared; timing only.
 //!
 //! Usage: bench <benchmarks-dir>
 
@@ -14,16 +13,15 @@ const std = @import("std");
 
 const usage = "usage: bench <benchmarks-dir>\n";
 
-/// Compiler under test, resolved from PATH at spawn time (install with
-/// install.sh).
+/// Compiler under test, resolved from PATH at spawn time (install.sh).
 const hcc = "hcc";
 
-/// Scratch dir for the compiled fixture executables: deterministic, inside
-/// the (gitignored) zig-out, wiped before and after a run.
+/// Scratch dir for compiled fixture executables: deterministic, inside the
+/// (gitignored) zig-out, wiped before and after a run.
 const tmp_dir_path = "zig-out/bench-tmp";
 
-/// clang optimization levels to compare against. -O4 is accepted by clang but
-/// is an alias for -O3, so the ladder stops there.
+/// clang optimization levels to compare against. -O4 is an alias for -O3, so
+/// the ladder stops there.
 const opt_levels = [_][]const u8{ "-O0", "-O1", "-O2", "-O3" };
 
 /// Column 0 is hcc; the rest are clang at each optimization level.
@@ -72,8 +70,8 @@ pub fn main(init: std.process.Init) !void {
     };
     defer dir.close(io);
 
-    // Pair up <stem>.HC / <stem>.c files; a fixture is only benchmarked when
-    // both sides exist.
+    // Pair up <stem>.HC / <stem>.c files; benchmarked only when both sides
+    // exist.
     var hc_stems: std.ArrayList([]const u8) = .empty;
     var c_stems: std.StringHashMapUnmanaged(void) = .empty;
     var it = dir.iterate();
@@ -100,9 +98,9 @@ pub fn main(init: std.process.Init) !void {
     }
     std.mem.sort([]const u8, stems.items, {}, stringLessThan);
 
-    // The target both compilers build for. Neither is cross-compiling (no
-    // --target / -target is passed), so both target the host; clang's
-    // -dumpmachine is the authoritative triple for that machine.
+    // The target both compilers build for. Neither cross-compiles (no --target
+    // is passed), so both target the host; clang's -dumpmachine is the
+    // authoritative triple for that machine.
     const target = try hostTriple(a, io);
     try stderr.print("bench: target {s} (host)\n", .{target});
     try stderr.flush();
@@ -146,9 +144,9 @@ fn stringLessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
     return std.mem.lessThan(u8, lhs, rhs);
 }
 
-/// The host target triple both compilers build for, from `clang -dumpmachine`
-/// (clang is already required for the C side). Falls back to "unknown" if
-/// clang cannot be queried.
+/// Host target triple both compilers build for, from `clang -dumpmachine`
+/// (clang is required for the C side anyway). "unknown" if clang can't be
+/// queried.
 fn hostTriple(a: std.mem.Allocator, io: std.Io) ![]const u8 {
     const result = std.process.run(a, io, .{
         .argv = &.{ "clang", "-dumpmachine" },
@@ -163,10 +161,9 @@ fn hostTriple(a: std.mem.Allocator, io: std.Io) ![]const u8 {
     return std.mem.trim(u8, result.stdout, " \t\r\n");
 }
 
-/// Runs argv once untimed (warmup), then `runs` more times, and returns the
-/// mean wall-clock duration in milliseconds. Any non-zero exit aborts the
-/// whole bench run: a fixture that fails to compile or crashes would silently
-/// skew the tables otherwise.
+/// Runs argv once untimed (warmup), then `runs` more times, returning the mean
+/// wall-clock duration in ms. Any non-zero exit aborts the whole bench run: a
+/// fixture that fails to compile or crashes would otherwise skew the tables.
 fn timedMeanMs(
     a: std.mem.Allocator,
     io: std.Io,

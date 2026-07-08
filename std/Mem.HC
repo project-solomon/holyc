@@ -1,11 +1,10 @@
 // Mem.HC — the task heap plus raw byte-buffer utilities.
 // `#include <Mem.HC>`.
 //
-// MAlloc/Free/MSize/HeapExtend are compiler intrinsics (each call lowers
-// directly to an IR op, so their prototype bodies are never emitted);
-// CAlloc/ReAlloc are ordinary HolyC built on top of them. MemCpy/MemSet/MemCmp
-// operate on U8* buffers with an explicit length. A host service, not part of
-// the dialect core.
+// MAlloc/Free/MSize/HeapExtend are compiler intrinsics (each call lowers to an
+// IR op, so their prototype bodies are never emitted); CAlloc/ReAlloc are
+// ordinary HolyC built on them. MemCpy/MemSet/MemCmp operate on U8* buffers
+// with an explicit length. A host service, not part of the dialect core.
 #ifndef __STD_MEM_HC
 #define __STD_MEM_HC
 
@@ -27,10 +26,9 @@ public U8 *CAlloc(I64 n)
   return p;
 }
 
-// ReAlloc resizes the block p (currently oldsz bytes) to newsz bytes. It grows in
-// place when p is the heap's last allocation (HeapExtend); otherwise it allocates a
-// new block, copies min(oldsz, newsz) bytes, and frees the old one. A NULL p just
-// allocates.
+// ReAlloc resizes block p (oldsz bytes) to newsz bytes. Grows in place when p
+// is the heap's last allocation (HeapExtend); otherwise allocates a new block,
+// copies min(oldsz, newsz) bytes, and frees the old one. A NULL p allocates.
 public U8 *ReAlloc(U8 *p, I64 oldsz, I64 newsz)
 {
   if (!p)

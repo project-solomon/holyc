@@ -1,20 +1,19 @@
-//! Per-architecture assembler register vocabularies, shared by the parser
-//! (is this identifier operand a register or a HolyC variable?) and the LLVM
-//! backend (which registers may a `reg <REG>` pin claim, and what does a
-//! named register clobber?). One source for both consumers so the two views
-//! can never drift; the backend builds constraint strings from these names
-//! but never the other way around (this module, like the rest of the front
-//! end, links no LLVM).
+//! Per-architecture assembler register vocabularies, shared by the parser (is
+//! this identifier operand a register or a HolyC variable?) and the LLVM backend
+//! (which registers may a `reg <REG>` pin claim, and what does a named register
+//! clobber?). One source for both so the views can't drift; the backend builds
+//! constraint strings from these names, never the reverse (this module links no
+//! LLVM, like the rest of the front end).
 //!
 //! Adding an architecture: add its qualifier to `arches`, its classification
-//! set, and its canonical-GP map here, then give the backend an
-//! `AsmArchInfo` entry (see hcc/llvm/lower.zig and docs/asm-roadmap.md).
+//! set, and its canonical-GP map here, then give the backend an `AsmArchInfo`
+//! entry (see hcc/llvm/lower.zig and docs/asm-roadmap.md).
 
 const std = @import("std");
 const target = @import("target.zig");
 
-/// The architecture qualifiers an asm block may carry (`asm amd64 { … }`).
-/// A bare `asm { … }` defaults to amd64; sema validates the qualifier.
+/// Architecture qualifiers an asm block may carry (`asm amd64 { … }`). A bare
+/// `asm { … }` defaults to amd64; sema validates the qualifier.
 pub const arches = [_][]const u8{ "amd64", "arm64", "riscv64", "ppc64le", "s390x" };
 
 pub fn isArch(name: []const u8) bool {
@@ -24,7 +23,7 @@ pub fn isArch(name: []const u8) bool {
     return false;
 }
 
-/// The asm-block qualifier for a build-target architecture.
+/// The asm-block qualifier for a target architecture.
 pub fn archName(arch: target.Arch) []const u8 {
     return switch (arch) {
         .amd64 => "amd64",
@@ -35,12 +34,11 @@ pub fn archName(arch: target.Arch) []const u8 {
     };
 }
 
-/// Whether name (case-insensitive) is a register of arch, so an identifier
-/// operand is a register rather than a variable/symbol reference. HolyC asm
-/// is case-insensitive for register names: RAX and rax are the same register.
-/// This is the full operand vocabulary (a superset of the pinnable GP set),
-/// including the stack/frame/instruction/zero registers and the FP/vector
-/// files.
+/// Whether name (case-insensitive) is a register of arch, distinguishing a
+/// register operand from a variable/symbol reference. Register names are
+/// case-insensitive: RAX and rax are the same register. This is the full operand
+/// vocabulary (a superset of the pinnable GP set), including the
+/// stack/frame/instruction/zero registers and the FP/vector files.
 pub fn isRegister(arch: []const u8, name: []const u8) bool {
     var buf: [8]u8 = undefined;
     if (name.len > buf.len) return false;
@@ -53,10 +51,10 @@ pub fn isRegister(arch: []const u8, name: []const u8) bool {
     return false;
 }
 
-/// The canonical 64-bit general-purpose register for a register spelling
-/// (case-insensitive), or null when it has no pinnable/clobberable GP form.
-/// The stack/frame/instruction/zero registers are absent: they
-/// may be named in an operand but are never pinned or clobbered.
+/// The canonical 64-bit GP register for a register spelling (case-insensitive),
+/// or null when it has no pinnable/clobberable GP form. The
+/// stack/frame/instruction/zero registers are absent: they may be named in an
+/// operand but are never pinned or clobbered.
 pub fn canonGp(arch: target.Arch, name: []const u8) ?[]const u8 {
     var buf: [8]u8 = undefined;
     if (name.len > buf.len) return null;
@@ -160,9 +158,9 @@ const riscv64_registers = std.StaticStringMap(void).initComptime(blk: {
 
 const ppc64le_registers = std.StaticStringMap(void).initComptime(blk: {
     @setEvalBranchQuota(40_000);
-    // HolyC source names PPC registers (r3, f1, v2, cr0) even though the
-    // assembler wants bare numbers — the backend strips the prefix when
-    // rendering. lr/ctr/xer only appear via mnemonics but classify anyway.
+    // HolyC source names PPC registers (r3, f1, v2, cr0) though the assembler
+    // wants bare numbers; the backend strips the prefix when rendering.
+    // lr/ctr/xer only appear via mnemonics but classify anyway.
     var names: []const []const u8 = &.{ "lr", "ctr", "xer" };
     for (0..32) |i| {
         const n = std.fmt.comptimePrint("{d}", .{i});
@@ -177,7 +175,7 @@ const ppc64le_registers = std.StaticStringMap(void).initComptime(blk: {
 const s390x_registers = std.StaticStringMap(void).initComptime(blk: {
     @setEvalBranchQuota(40_000);
     // HolyC source names s390x registers bare (r2); the backend renders the
-    // %-prefixed spelling the assembler requires.
+    // %-prefixed spelling the assembler wants.
     var names: []const []const u8 = &.{};
     for (0..16) |i| {
         const n = std.fmt.comptimePrint("{d}", .{i});
@@ -226,7 +224,7 @@ const arm64_canon_gp = std.StaticStringMap([]const u8).initComptime(blk: {
     @setEvalBranchQuota(40_000);
     var entries: []const CanonEntry = &.{.{ "lr", "x30" }};
     for (0..31) |i| {
-        if (i == 29) continue; // x29 is the frame pointer: not pinnable/clobberable
+        if (i == 29) continue; // x29 is the frame pointer: not pinnable
         const x = std.fmt.comptimePrint("x{d}", .{i});
         const w = std.fmt.comptimePrint("w{d}", .{i});
         entries = entries ++ [_]CanonEntry{ .{ x, x }, .{ w, x } };
@@ -237,8 +235,8 @@ const arm64_canon_gp = std.StaticStringMap([]const u8).initComptime(blk: {
 const riscv64_canon_gp = std.StaticStringMap([]const u8).initComptime(blk: {
     @setEvalBranchQuota(40_000);
     // Canonical names are the x registers (LLVM's constraint spelling).
-    // zero (x0), ra (x1), sp (x2), gp (x3), tp (x4), and s0/fp (x8) are
-    // absent: never pinned or clobbered.
+    // zero (x0), ra (x1), sp (x2), gp (x3), tp (x4), and s0/fp (x8) are absent:
+    // never pinned or clobbered.
     var entries: []const CanonEntry = &.{};
     for (5..32) |i| {
         if (i == 8) continue;
@@ -265,10 +263,10 @@ const riscv64_canon_gp = std.StaticStringMap([]const u8).initComptime(blk: {
 
 const ppc64le_canon_gp = std.StaticStringMap([]const u8).initComptime(blk: {
     @setEvalBranchQuota(40_000);
-    // r1 (stack pointer), r2 (TOC), r13 (thread pointer), and r31 (frame
-    // pointer when present) are absent: never pinned or
-    // clobbered. r0 stays clobberable (it is a mutable GPR) even though
-    // pinning it is inadvisable (r0 reads as zero in address bases).
+    // r1 (stack pointer), r2 (TOC), r13 (thread pointer), and r31 (frame pointer
+    // when present) are absent: never pinned or clobbered. r0 stays clobberable
+    // (a mutable GPR) though pinning it is inadvisable (r0 reads as zero in
+    // address bases).
     var entries: []const CanonEntry = &.{};
     for (0..32) |i| {
         if (i == 1 or i == 2 or i == 13 or i == 31) continue;
@@ -280,8 +278,8 @@ const ppc64le_canon_gp = std.StaticStringMap([]const u8).initComptime(blk: {
 
 const s390x_canon_gp = std.StaticStringMap([]const u8).initComptime(blk: {
     @setEvalBranchQuota(40_000);
-    // r15 (stack pointer) and r11 (frame pointer when present) are
-    // absent. r14 (return address) stays, mirroring arm64's lr.
+    // r15 (stack pointer) and r11 (frame pointer when present) are absent.
+    // r14 (return address) stays, mirroring arm64's lr.
     var entries: []const CanonEntry = &.{};
     for (0..16) |i| {
         if (i == 11 or i == 15) continue;

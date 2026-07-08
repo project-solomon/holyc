@@ -17,7 +17,7 @@
 //!   - Every local (and parameter) lives in an alloca in the function's entry
 //!     block; LLVM's mem2reg (run as part of default<O2>) rebuilds SSA.
 //!   - Defined HolyC functions get internal linkage so whole-program DCE can
-//!     drop the unused parts of the always-resident prelude.
+//!     drop the unused parts of the always-resident core.
 
 const std = @import("std");
 const c = @import("c.zig");
@@ -43,7 +43,7 @@ pub const Input = struct {
 /// compilation, shared libraries), `public` functions and globals defined in
 /// the user's own source keep external linkage: they are the unit's exports
 /// and survive whole-program DCE. A unit with no top-level code gets no
-/// `main`. Prelude definitions stay internal in both modes; the prelude spells
+/// `main`. Core definitions stay internal in both modes; the core spells
 /// everything `public`, but it is each unit's private runtime, not an export
 /// surface.
 pub const Mode = enum { exe, library };
@@ -56,8 +56,8 @@ pub fn run(arena: std.mem.Allocator, diags: *diag.Diagnostics, in: Input) Error!
         break :blk empty;
     };
     // A second builder dedicated to allocas, positioned into each function's
-    // entry block, so every alloca lands there. Also makes jumping over
-    // declarations with goto safe.
+    // entry block, so every alloca lands there. Also makes goto over
+    // declarations safe.
     const ab = c.LLVMCreateBuilderInContext(in.ctx);
     defer c.LLVMDisposeBuilder(ab);
 
@@ -537,7 +537,7 @@ const Lowerer = struct {
     }
 
     /// Builds the global table: declared globals, the Fs exception context
-    /// (when the prelude's CTask exists), and the implicit command-line /
+    /// (when the core's CTask exists), and the implicit command-line /
     /// environment globals (each only when the program actually uses it).
     fn registerGlobals(l: *Lowerer) Error!void {
         for (l.prog.items) |item| {
@@ -631,7 +631,7 @@ const Lowerer = struct {
 
     /// Whether a defined function/global is part of the unit's export surface:
     /// library mode, `public`, and defined in the user's own source (file 0;
-    /// the prelude spells everything public but is each unit's private
+    /// the core spells everything public but is each unit's private
     /// runtime).
     fn exportsName(l: *const Lowerer, is_public: bool, def_file: u32) bool {
         return l.mode == .library and is_public and def_file == 0;
@@ -1155,13 +1155,13 @@ const FnCtx = struct {
 
     fn fsFieldPtr(fc: *FnCtx, off: u64, span: source.Span) Error!*c.Value {
         const l = fc.l;
-        const g = l.globals.get("Fs") orelse return l.failAt(span, "Fs is not available (the prelude's CTask is missing)", .{});
+        const g = l.globals.get("Fs") orelse return l.failAt(span, "Fs is not available (the core's CTask is missing)", .{});
         const fs = c.LLVMBuildLoad2(l.b, l.ty_ptr, g.value, "");
         return l.gepByte(fs, off);
     }
 
     fn fsOffs(fc: *FnCtx, span: source.Span) Error!FsOffsets {
-        return fc.l.fs_offsets orelse fc.l.failAt(span, "Fs is not available (the prelude's CTask is missing)", .{});
+        return fc.l.fs_offsets orelse fc.l.failAt(span, "Fs is not available (the core's CTask is missing)", .{});
     }
 
     /// Restores Fs->exc_top to the state before the try region at

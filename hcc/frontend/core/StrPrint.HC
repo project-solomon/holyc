@@ -1,23 +1,24 @@
 // StrPrint.HC — the print core: Print/FPrint and the pure-HolyC %-formatter,
-// including exact round-half-even float formatting (the Fbn big-integer path). It
-// is built on StdWrite, the compiler's sole output primitive, so the interpreter
-// and every backend produce identical bytes. Part of the always-resident prelude
-// (see Lib.HC).
+// including exact round-half-even float formatting (the Fbn big-integer path).
+// Built on StdWrite, the compiler's sole output primitive, so the interpreter
+// and every backend produce identical bytes. Part of the always-resident core
+// (see core.zig).
 //
 // StdWrite is a compiler intrinsic: the prototype puts it in scope for the
-// type-checker; the compiler lowers each call directly to an IR op (PrimInst), so
-// its prototype body is never emitted. The whole formatter lives in one file
-// because its non-public helpers call each other across the integer/float split.
-#ifndef __PRELUDE_STRPRINT_HC
-#define __PRELUDE_STRPRINT_HC
+// type-checker; the compiler lowers each call to an IR op (PrimInst), so its
+// prototype body is never emitted. The whole formatter lives in one file
+// because its non-public helpers call each other across the integer/float
+// split.
+#ifndef __CORE_STRPRINT_HC
+#define __CORE_STRPRINT_HC
 
 public I64 StdWrite(I64 fd, U8 *buf, I64 count); // write count bytes of buf to fd; returns count
 
 // ---- print core ----------------------------------------------------------
 // StdWrite(fd, buf, count) is the compiler's sole output primitive. Everything
-// below is ordinary HolyC, so the oracle and the native backends produce identical
-// bytes. The %-walker (_VFmt) takes the varargs explicitly (argv/argc) so the
-// public Print/FPrint can forward their own varargs to it.
+// below is ordinary HolyC, so the oracle and native backends produce identical
+// bytes. The %-walker (_VFmt) takes the varargs explicitly (argv/argc) so
+// Print/FPrint can forward their own varargs to it.
 
 // _Wr writes n bytes of s to fd (n <= 0 writes nothing).
 U0 _Wr(I64 fd, U8 *s, I64 n)
@@ -69,7 +70,7 @@ I64 _U64Str(U8 *out, U64 v, I64 base, I64 upper)
 // Exact decimal conversion via a base-2^32 big integer (Fbn): %f/%e/%g are
 // correctly rounded and identical in the interpreter and every backend.
 
-// Reinterpret a double as its 64-bit pattern and back (a byte-level pun via memory).
+// Reinterpret a double as its 64-bit pattern and back (a memory pun).
 I64 FltToBits(F64 x) { return *(I64 *)(&x); }
 F64 FltFromBits(I64 b) { return *(F64 *)(&b); }
 
@@ -514,7 +515,7 @@ I64 _VFmt(I64 fd, U8 *fmt, I64 *argv, I64 argc)
     U8 conv = fmt[i];
     i = i + 1;
 
-    // Floating point: the exact formatter builds the whole field; we just emit it.
+    // Floating point: the exact formatter builds the whole field; emit it.
     if (conv == 'f' || conv == 'e' || conv == 'E' || conv == 'g' || conv == 'G') {
       F64 v = *(F64 *)(&argv[ai]);
       ai = ai + 1;
@@ -638,4 +639,4 @@ public I64 FPrint(I64 fd, U8 *fmt, ...)
   return _VFmt(fd, fmt, argv, argc);
 }
 
-#endif // __PRELUDE_STRPRINT_HC
+#endif // __CORE_STRPRINT_HC

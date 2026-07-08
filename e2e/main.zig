@@ -1,33 +1,31 @@
-//! The e2e harness: a standalone test driver with no code dependency on the
-//! compiler. It invokes the installed `hcc` from the PATH (run install.sh to
-//! build and install it), compiles every fixture in the golden directory,
-//! runs each produced executable, and byte-compares its stdout against the
-//! golden `<fixture>.out`.
+//! e2e harness: standalone test driver, no code dependency on the compiler.
+//! Invokes the installed `hcc` from PATH (run install.sh to build and install
+//! it), compiles every fixture in the golden directory, runs each executable,
+//! and byte-compares its stdout against the golden `<fixture>.out`.
 //!
 //! Usage: e2e <golden-dir>
 //!
 //! Fixtures run in sorted order with a progress line each (compile and run
-//! timings). Failures print their detail immediately; the run ends with a
-//! timed summary.
+//! timings). Failures print detail immediately; the run ends with a timed
+//! summary.
 //!
-//! Fixtures are the contract and are never edited or skipped to make a run
-//! pass. A fixture needing different behavior is compiled/run with different
-//! hcc CLI arguments instead.
+//! Fixtures are the contract; never edited or skipped to make a run pass. A
+//! fixture needing different behavior is compiled/run with different hcc CLI
+//! arguments instead.
 //!
-//! Host target only. Exit codes of the fixture binaries are not compared;
-//! goldens are stdout only, matching the retired Go conform_test.go. Exits 0
-//! iff every fixture matches its golden.
+//! Host target only. Fixture exit codes are not compared; goldens are stdout
+//! only, matching the retired Go conform_test.go. Exits 0 iff every fixture
+//! matches its golden.
 
 const std = @import("std");
 
 const usage = "usage: e2e <golden-dir>\n";
 
-/// Compiler under test, resolved from PATH at spawn time (install with
-/// install.sh).
+/// Compiler under test, resolved from PATH at spawn time (install.sh).
 const hcc = "hcc";
 
-/// Scratch dir for the compiled fixture executables: deterministic, inside
-/// the (gitignored) zig-out, wiped before and after a run.
+/// Scratch dir for compiled fixture executables: deterministic, inside the
+/// (gitignored) zig-out, wiped before and after a run.
 const tmp_dir_path = "zig-out/e2e-tmp";
 
 pub fn main(init: std.process.Init) !void {
@@ -55,8 +53,8 @@ pub fn main(init: std.process.Init) !void {
     };
     defer dir.close(io);
 
-    // Collect and sort the fixture names first: deterministic run order, a
-    // total for the header, and a column width for aligned output.
+    // Collect and sort fixture names first: deterministic order, a total for
+    // the header, and a column width for aligned output.
     var names: std.ArrayList([]const u8) = .empty;
     var max_name_len: usize = 0;
     {
@@ -101,8 +99,8 @@ pub fn main(init: std.process.Init) !void {
         const golden_name = try std.fmt.allocPrint(a, "{s}.out", .{stem});
         const golden = try dir.readFileAlloc(io, golden_name, a, .limited(16 << 20));
 
-        // The progress prefix goes out before the work so a hang is
-        // attributable to a fixture.
+        // Progress prefix goes out before the work so a hang is attributable
+        // to a fixture.
         try out.print("  [{d:>2}/{d}] {s}", .{ i, names.items.len, name });
         try padTo(out, name.len, max_name_len);
         try out.flush();
@@ -130,8 +128,8 @@ pub fn main(init: std.process.Init) !void {
             continue;
         }
 
-        // Run the produced binary and collect stdout (std.process.run drains
-        // the pipes before waiting, so a large output cannot deadlock).
+        // Run the binary and collect stdout (std.process.run drains the pipes
+        // before waiting, so large output cannot deadlock).
         const run_result = std.process.run(a, io, .{
             .argv = &.{exe_path},
             .stdout_limit = .limited(16 << 20),
@@ -177,7 +175,7 @@ fn printMs(w: *std.Io.Writer, d: std.Io.Clock.Duration, label: []const u8) !void
     try w.print("  {d:>4}ms{s}", .{ ms, label });
 }
 
-/// Renders a byte-exact first-difference report for a golden mismatch.
+/// Byte-exact first-difference report for a golden mismatch.
 fn reportDiff(w: *std.Io.Writer, name: []const u8, want: []const u8, got: []const u8) !void {
     var i: usize = 0;
     const n = @min(want.len, got.len);

@@ -1,19 +1,18 @@
 //! Runtime class reflection (HolyC's class metadata). For each named class
-//! (user classes and prelude classes alike), this pass synthesizes the
-//! descriptor tables that KClass.HC's CHashClass / CMemberLst describe, plus
-//! the body of Class(name):
+//! (user and core alike), this pass synthesizes the descriptor tables that
+//! KClass.HC's CHashClass / CMemberLst describe, plus the body of Class(name):
 //!
-//!   - a `CMemberLst $reflm_<C>[n]` global holding one entry per member, and
-//!     a `CHashClass $refl_<C>` global heading the chain;
+//!   - a `CMemberLst $reflm_<C>[n]` global with one entry per member, and a
+//!     `CHashClass $refl_<C>` global heading the chain;
 //!   - top-level statements that fill them (member name (string), offset
 //!     (offset(C.m)), size (sizeof(member type)), type spelling (string), and
-//!     the `next` links); they run at program entry before user code;
+//!     the `next` links), run at program entry before user code;
 //!   - `Class(name)` returning the matching descriptor (or NULL).
 //!
-//! It runs after parsing and before sema, so the synthesized AST is
-//! type-checked, laid out, and lowered like any other code, needing no new
-//! backend machinery. Descriptor globals are BSS filled by entry-time stores;
-//! names are string literals. Emitted only when the program uses Class/ClassRep.
+//! Runs after parsing and before sema, so the synthesized AST is type-checked,
+//! laid out, and lowered like any other code, needing no new backend
+//! machinery. Descriptor globals are BSS filled by entry-time stores; names are
+//! string literals. Emitted only when the program uses Class/ClassRep.
 
 const std = @import("std");
 const source = @import("source.zig");
@@ -28,8 +27,8 @@ const cmembermeta_named: ast.Type = .{ .named = "CMemberMeta" };
 const chashclass_named: ast.Type = .{ .named = "CHashClass" };
 const chashclass_ptr: ast.Type = .{ .ptr = &chashclass_named };
 
-/// Appends class-reflection descriptors and the Class() body to prog, in
-/// place. A no-op unless the user program calls Class or ClassRep.
+/// Appends class-reflection descriptors and the Class() body to prog, in place.
+/// No-op unless the user program calls Class or ClassRep.
 pub fn synthReflectMeta(arena: std.mem.Allocator, prog: *ast.Program) Oom!void {
     if (!usesReflection(prog)) return;
 
@@ -51,10 +50,10 @@ pub fn synthReflectMeta(arena: std.mem.Allocator, prog: *ast.Program) Oom!void {
             .class_def => |cd| cd,
             else => continue,
         };
-        // Every named class is reflectable: user classes and prelude classes
-        // alike. Skip only compiler-synthesized anonymous aggregates (their
-        // members are promoted into their enclosing class) and any duplicate
-        // (a prototype plus its definition both reach here).
+        // Every named class is reflectable, user and core alike. Skip only
+        // compiler-synthesized anonymous aggregates (their members are promoted
+        // into the enclosing class) and duplicates (prototype plus definition
+        // both reach here).
         if (ast.isAnonField(cd.name)) continue;
         if (seen.contains(cd.name)) continue;
         try seen.put(arena, cd.name, {});
@@ -121,9 +120,9 @@ pub fn synthReflectMeta(arena: std.mem.Allocator, prog: *ast.Program) Oom!void {
         }
     }
 
-    // Descriptor globals and Class() are declarations (their order is
-    // irrelevant). The init statements must run before user code, so the
-    // whole block is prepended: it executes first in the synthesized entry.
+    // Descriptor globals and Class() are declarations (order irrelevant). The
+    // init statements must run before user code, so the whole block is
+    // prepended to run first in the synthesized entry.
     var new_items: std.ArrayList(*ast.Stmt) = .empty;
     try new_items.appendSlice(arena, decls.items);
     try new_items.append(arena, try classFunc(&g, classes.items));
@@ -133,8 +132,8 @@ pub fn synthReflectMeta(arena: std.mem.Allocator, prog: *ast.Program) Oom!void {
 }
 
 /// Whether the user's own code (file 0) calls Class or ClassRep. The resident
-/// ClassRep always calls Class, so checking the whole program would always be
-/// true. Restricting to file 0 limits the check to user code.
+/// ClassRep always calls Class, so checking the whole program is always true;
+/// file 0 limits the check to user code.
 fn usesReflection(prog: *const ast.Program) bool {
     const names = [_][]const u8{ "Class", "ClassRep" };
     for (prog.items) |it| {
@@ -143,21 +142,20 @@ fn usesReflection(prog: *const ast.Program) bool {
     return false;
 }
 
-/// One reflectable member after flattening: its name within the class, its
-/// type, and any metadata. Inherited and anonymous-union-promoted members are
-/// reached by their flat name, which offset()/sizeof() resolve against the
-/// class's flattened layout.
+/// One reflectable member after flattening: name within the class, type, and
+/// any metadata. Inherited and anonymous-union-promoted members are reached by
+/// their flat name, which offset()/sizeof() resolve against the flattened
+/// layout.
 const MemberRef = struct {
     name: []const u8,
     ty: ast.Type,
     meta: []const ast.FieldMeta,
 };
 
-/// Appends a class's reflectable members in layout order: first the base
-/// class's members (a base subobject sits at offset 0), then each own field,
-/// with anonymous embedded unions/structs expanded in place into the members
-/// they promote. seen guards against a malformed base cycle (the layout pass
-/// reports it).
+/// Appends a class's reflectable members in layout order: base class members
+/// first (the base subobject sits at offset 0), then each own field, with
+/// anonymous embedded unions/structs expanded in place. seen guards against a
+/// malformed base cycle (the layout pass reports it).
 fn flattenMembers(
     arena: std.mem.Allocator,
     cd: *const ast.ClassDef,
@@ -221,9 +219,8 @@ fn classFunc(g: *Gen, classes: []const *const ast.ClassDef) Oom!*ast.Stmt {
 // ---- synthetic-node constructors ----
 //
 // Every synthesized node carries ast.generated_file as its span's file id, so
-// sema treats it as compiler-generated and exempt from file-privacy checks
-// (it may reference any user class/member and the resident reflection
-// helpers).
+// sema treats it as compiler-generated and exempt from file-privacy checks (it
+// may reference any user class/member and the resident reflection helpers).
 
 const Gen = struct {
     arena: std.mem.Allocator,

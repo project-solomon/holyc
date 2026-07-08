@@ -21,7 +21,7 @@ const TestRun = struct {
     failed: bool,
 
     const Opts = struct {
-        inject_prelude: bool = false,
+        inject_core: bool = false,
     };
 
     fn init(src: []const u8, opts: Opts) !TestRun {
@@ -37,7 +37,7 @@ const TestRun = struct {
         var failed = false;
         if (frontend.run(arena, diags, testing.io, src, .{
             .target = target_mod.Target.host(),
-            .inject_prelude = opts.inject_prelude,
+            .inject_core = opts.inject_core,
         })) |res| {
             prog = res.program;
         } else |e| switch (e) {
@@ -556,7 +556,7 @@ test "reflection synthesis type-checks under the full pipeline" {
         \\class Pt { I64 x, y; U8 tag format "%X"; };
         \\ClassRep("Pt");
         \\
-    , .{ .inject_prelude = true });
+    , .{ .inject_core = true });
     defer t.deinit();
     try t.expectClean();
     const prog = t.prog.?;
@@ -589,7 +589,7 @@ test "no reflection tables without Class/ClassRep use" {
         \\Pt p;
         \\p.x = 1;
         \\
-    , .{ .inject_prelude = true });
+    , .{ .inject_core = true });
     defer t.deinit();
     try t.expectClean();
     for (t.prog.?.items) |it| {

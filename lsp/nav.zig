@@ -7,7 +7,7 @@
 //! are name-based and scope-free: a name resolves to the top-level declaration
 //! of that name and to every bare-identifier use of it; member accesses
 //! (`x.field`) are not uses of a top-level `field`. Only the user's own file
-//! (spans with file == 0) is considered; the prelude and #include'd frames have
+//! (spans with file == 0) is considered; the core and #include'd frames have
 //! no position in the buffer.
 
 const std = @import("std");
@@ -28,8 +28,8 @@ pub const Def = struct {
 /// Byte offsets [start, end) of a name within the source text.
 pub const Offsets = struct { start: usize, end: usize };
 
-/// True for bytes that may appear in a HolyC identifier (ASCII letters, digits,
-/// underscore) — matches the lexer's identifier-continuation set.
+/// True for bytes valid in a HolyC identifier (ASCII letters, digits,
+/// underscore); matches the lexer's identifier-continuation set.
 fn isIdentByte(b: u8) bool {
     return b == '_' or (b >= 'a' and b <= 'z') or (b >= 'A' and b <= 'Z') or (b >= '0' and b <= '9');
 }
@@ -107,27 +107,27 @@ pub fn findDef(src: []const u8, items: []const *hcc.ast.Stmt, name: []const u8) 
     return best;
 }
 
-/// A prelude declaration located for go-to-definition into the embedded core:
+/// A core declaration located for go-to-definition into the embedded core:
 /// the core file's name (e.g. "StrPrint.HC") and the range covering the name in
 /// that file's source.
-pub const PreludeDef = struct {
+pub const CoreDef = struct {
     core_name: []const u8,
     range: Range,
 };
 
 /// Locates the declaration of `name` among the top-level items that came from
-/// the embedded prelude (an item whose file, via `files`, is a core file),
+/// the embedded core (an item whose file, via `files`, is a core file),
 /// preferring a real definition over a prototype. Ranges are computed against
 /// the core file's own source (from `hcc.core`), which is byte-identical to the
 /// extracted cache copy the returned range will point into. Returns null when
-/// `name` is not declared in the prelude.
-pub fn findPreludeDef(
+/// `name` is not declared in the core.
+pub fn findCoreDef(
     items: []const *hcc.ast.Stmt,
     files: []const hcc.source.FileInfo,
     name: []const u8,
-) ?PreludeDef {
+) ?CoreDef {
     if (name.len == 0) return null;
-    var best: ?PreludeDef = null;
+    var best: ?CoreDef = null;
     var best_is_proto = false;
     for (items) |item| {
         const fid = item.span.file;
@@ -392,7 +392,7 @@ test wordAt {
     try std.testing.expectEqualStrings("", wordAt(src, 4)); // in the gap between the two spaces
 }
 
-test findPreludeDef {
+test findCoreDef {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -401,19 +401,19 @@ test findPreludeDef {
     var files: []const hcc.source.FileInfo = &.{};
     const res = try hcc.frontend.run(arena, &diags, std.testing.io, "U0 Main() {}\n", .{
         .target = hcc.target.Target.host(),
-        .inject_prelude = true,
+        .inject_core = true,
         .files_out = &files,
     });
 
-    // A prelude function resolves to its core file (FltToBits is in StrPrint.HC).
-    const pd = findPreludeDef(res.program.items, files, "FltToBits") orelse
-        return error.PreludeSymbolNotFound;
+    // A core function resolves to its core file (FltToBits is in StrPrint.HC).
+    const pd = findCoreDef(res.program.items, files, "FltToBits") orelse
+        return error.CoreSymbolNotFound;
     try std.testing.expectEqualStrings("StrPrint.HC", pd.core_name);
     try std.testing.expect(hcc.core.exists(pd.core_name));
 
-    // A user-file symbol (file 0) is not a prelude def, nor is an unknown name.
-    try std.testing.expect(findPreludeDef(res.program.items, files, "Main") == null);
-    try std.testing.expect(findPreludeDef(res.program.items, files, "NopeNotReal") == null);
+    // A user-file symbol (file 0) is not a core def, nor is an unknown name.
+    try std.testing.expect(findCoreDef(res.program.items, files, "Main") == null);
+    try std.testing.expect(findCoreDef(res.program.items, files, "NopeNotReal") == null);
 }
 
 test pathToUri {

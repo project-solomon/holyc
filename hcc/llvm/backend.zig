@@ -1,7 +1,7 @@
-//! Code generator: drives the LLVM-C API (linked in-process from the system
-//! LLVM; see build.zig's -Dllvm-prefix) to translate the checked AST into an
-//! LLVM module, verify and optimize it, emit a native object, and link the
-//! final artifact with the host C toolchain.
+//! Code generator: drives the LLVM-C API (linked in-process; see build.zig's
+//! -Dllvm-prefix) to translate the checked AST into an LLVM module, verify and
+//! optimize it, emit a native object, and link the final artifact with the host
+//! C toolchain.
 
 const std = @import("std");
 const c = @import("c.zig");
@@ -19,23 +19,23 @@ pub const Options = struct {
     target: target_mod.Target,
     kind: EmitKind,
     out_path: []const u8,
-    /// Libraries to link against (-l), so `extern` imports resolve beyond
-    /// libc; and extra search directories (-L).
+    /// Libraries to link against (-l), so `extern` imports resolve beyond libc,
+    /// plus extra search directories (-L).
     libs: []const []const u8 = &.{},
     lib_dirs: []const []const u8 = &.{},
-    /// Explicit C compiler driver for the link step (--cc / HCC_CC). null
-    /// picks the default: the system `cc` for the host target, or
+    /// Explicit C compiler driver for the link step (--cc / HCC_CC). null picks
+    /// the default: the system `cc` for the host target, or
     /// `zig cc -target <triple>` (bundled sysroots) for a cross target.
     cc: ?[]const u8 = null,
-    /// Run the standard LLVM optimization pipeline (default<O2>). Off is
-    /// useful when debugging the lowering.
+    /// Run the standard LLVM optimization pipeline (default<O2>). Off helps when
+    /// debugging the lowering.
     optimize: bool = true,
-    /// Print the LLVM IR to stderr before verification (debugging aid).
+    /// Print the LLVM IR to stderr before verification.
     dump_ir: bool = false,
 };
 
 // LLVM target registration is idempotent; a plain flag suffices for the
-// driver's single-threaded compilations.
+// driver's single-threaded compilation.
 var targets_initialized = false;
 
 fn ensureTargets() void {
@@ -45,8 +45,8 @@ fn ensureTargets() void {
     }
 }
 
-/// The running libLLVM version (major, minor, patch). It links dynamically, so
-/// this is a runtime property; the driver folds it into the build-cache key so a
+/// The running libLLVM version (major, minor, patch), a runtime property since
+/// it links dynamically. The driver folds it into the build-cache key so a
 /// libLLVM upgrade invalidates cached objects even when hcc is unchanged.
 pub fn llvmVersion() [3]c_uint {
     var major: c_uint = 0;
@@ -57,7 +57,7 @@ pub fn llvmVersion() [3]c_uint {
 }
 
 /// Compiles a checked program to opts.out_path: produces the object, then links
-/// it. A convenience over emitObject + linkObject for callers that do not cache
+/// it. Convenience over emitObject + linkObject for callers that do not cache
 /// (e.g. the #exe executor); the driver caches the object and links separately.
 pub fn emit(
     arena: std.mem.Allocator,
@@ -67,7 +67,7 @@ pub fn emit(
     opts: Options,
 ) Error!void {
     if (opts.kind == .obj) return emitObject(arena, diags, prog, opts, opts.out_path);
-    // The suffix must end in ".o": compiler drivers (zig cc in particular)
+    // The suffix must end in ".o": compiler drivers (zig cc especially)
     // classify link inputs by extension.
     const obj_path = try std.fmt.allocPrint(arena, "{s}.tmp.o", .{opts.out_path});
     defer std.Io.Dir.cwd().deleteFile(io, obj_path) catch {};
@@ -76,8 +76,8 @@ pub fn emit(
 }
 
 /// Lowers, verifies, and optimizes the program, writing the native object to
-/// obj_path. This is the expensive, cacheable step (LLVM O2 + codegen); linking
-/// is separate (linkObject) so it can run against current libraries every time.
+/// obj_path. The expensive, cacheable step (LLVM O2 + codegen); linking is
+/// separate (linkObject) so it runs against current libraries every time.
 /// opts.kind selects the lowering mode (exe = whole program; obj/shared =
 /// separate-compilation unit that exports its public definitions).
 pub fn emitObject(
@@ -96,8 +96,8 @@ pub fn emitObject(
     const builder = c.LLVMCreateBuilderInContext(ctx);
     defer c.LLVMDisposeBuilder(builder);
 
-    // Target machine first, so the module carries the right data layout while
-    // lowering runs.
+    // Target machine first, so the module carries the right data layout during
+    // lowering.
     var triple_buf: [64]u8 = undefined;
     const triple = opts.target.llvmTriple(&triple_buf);
     const triple_z = try arena.dupeZ(u8, triple);

@@ -1,17 +1,15 @@
-//! The HolyC parser: turns the preprocessor's token stream into an AST
-//! Program.
+//! The HolyC parser: turns the preprocessor's token stream into an AST Program.
 //!
-//! It is a hand-written recursive-descent parser with precedence climbing for
-//! expressions. It pulls tokens from the Preprocessor on demand through a
-//! small look-ahead buffer, lexing only as far ahead as the grammar needs.
-//! The first parse error stops the pass: it is recorded in the shared
-//! Diagnostics and `error.CompileFailed` unwinds the recursion out of parse.
+//! Hand-written recursive-descent with precedence climbing for expressions. It
+//! pulls tokens from the Preprocessor on demand through a small look-ahead
+//! buffer, lexing only as far ahead as the grammar needs. The first parse error
+//! stops the pass: it is recorded in the shared Diagnostics and
+//! `error.CompileFailed` unwinds the recursion out of parse.
 //!
-//! The pass covers functions, variable declarations, classes (including
-//! anonymous embedded unions/structs and inline instance declarations), the
-//! full statement and expression grammar, inline asm, and
-//! base/pointer/array/function-pointer types. It stops at the syntactic
-//! Program; semantic analysis and layout are later passes.
+//! Covers functions, variable declarations, classes (including anonymous
+//! embedded unions/structs and inline instance declarations), the statement and
+//! expression grammar, inline asm, and base/pointer/array/function-pointer
+//! types. It stops at the syntactic Program; sema and layout are later passes.
 
 const std = @import("std");
 const source = @import("source.zig");
@@ -169,9 +167,9 @@ fn advance(p: *Parser) Error!Token {
     return t;
 }
 
-/// The current token's span, for diagnostics. It reads only the
-/// already-buffered token (never lexes), so it cannot fail; call sites reach
-/// it after a successful peek, with the current token in hand.
+/// The current token's span, for diagnostics. Reads only the buffered token
+/// (never lexes), so it cannot fail; call sites reach it after a successful
+/// peek, with the current token in hand.
 fn curSpan(p: *Parser) source.Span {
     if (p.head < p.buf.items.len) return p.buf.items[p.head].span;
     return .{};
@@ -247,12 +245,11 @@ fn expectIdent(p: *Parser) Error![]const u8 {
 
 // ---- program ----
 
-/// Parses one program-level item. Unlike parseStmt it permits the constructs
-/// that are legal only at file scope: function definitions, `public`
-/// declarations, and the extern forms. A plain type start may introduce either
-/// a function or a global variable, so it routes through parseTopLevelDecl;
-/// class definitions and every other construct are ordinary statements and
-/// defer to parseStmtInner.
+/// Parses one program-level item. Unlike parseStmt it permits file-scope-only
+/// constructs: function definitions, `public` declarations, and the extern
+/// forms. A plain type start may introduce a function or a global variable, so
+/// it routes through parseTopLevelDecl; classes and everything else defer to
+/// parseStmtInner.
 fn parseTopLevel(p: *Parser) Error!*ast.Stmt {
     try p.enterRecursion();
     defer p.depth -= 1;
@@ -267,11 +264,10 @@ fn parseTopLevel(p: *Parser) Error!*ast.Stmt {
                 _ = try p.advance();
                 return p.parsePublicDecl(m);
             },
-            // `_extern <LABEL> <sig>;` (and `_import`): a typed HolyC name
-            // forward-bound to an asm-defined label. The declaration has no
-            // body; call sites emit a call to the label, which a top-level
-            // `asm {}` block defines.
-            ._extern, ._import => {
+            // `_extern <LABEL> <sig>;`: a typed HolyC name forward-bound to an
+            // asm-defined label. The declaration has no body; call sites emit a
+            // call to the label, which a top-level `asm {}` block defines.
+            ._extern => {
                 _ = try p.advance();
                 return p.parseAsmExternDecl(m);
             },
@@ -295,10 +291,10 @@ fn parseTopLevel(p: *Parser) Error!*ast.Stmt {
     return p.parseStmtInner();
 }
 
-/// Whether the upcoming tokens are a function definition whose return type is
-/// omitted (HolyC defaults it to I64), i.e. `Name ( params ) {`. It scans to
-/// the `(`'s matching `)` and checks for a `{`, so it never mistakes a
-/// paren-less call statement (`Name();`) for a definition.
+/// Whether the upcoming tokens are a function definition with omitted return
+/// type (HolyC defaults it to I64), i.e. `Name ( params ) {`. Scans to the
+/// `(`'s matching `)` and checks for a `{`, so a call statement (`Name();`) is
+/// not mistaken for a definition.
 fn looksLikeImplicitRetFnDef(p: *Parser) Error!bool {
     const t0 = try p.peekN(0);
     if (t0.kind != .ident) return false;
@@ -764,8 +760,7 @@ fn parseAsmMem(p: *Parser, arch: []const u8, ty: []const u8, m: Mark) Error!ast.
     const mem = try p.arena.create(ast.AsmMem);
     mem.* = .{ .ty = ty };
 
-    // Optional leading displacement before '[': a number or a symbolic
-    // constant.
+    // Optional leading displacement before '[': a number or symbolic constant.
     const t = try p.peek();
     switch (t.kind) {
         .int => |v| {
@@ -778,8 +773,7 @@ fn parseAsmMem(p: *Parser, arch: []const u8, ty: []const u8, m: Mark) Error!ast.
             mem.disp = -it.kind.int;
         },
         .ident => |name| {
-            // A symbolic displacement (e.g. SF_ARG1), only when it precedes
-            // the '['.
+            // A symbolic displacement (e.g. SF_ARG1), only when it precedes the '['.
             if (!ast.isAsmRegister(arch, name)) {
                 const t1 = try p.peekN(1);
                 if (t1.kind == .l_bracket) {
@@ -971,9 +965,9 @@ const DeclHead = struct {
 };
 
 /// Parses `<LABEL> <return-type> <name>(<params>);` introduced by a leading
-/// `_extern` (or `_import`), already consumed. The asm label plus declarator
-/// give the function a typed HolyC name bound to an asm-defined label of a
-/// different spelling; the declaration has no body.
+/// `_extern`, already consumed. The asm label plus declarator give the function
+/// a typed HolyC name bound to an asm-defined label of a different spelling; no
+/// body.
 fn parseAsmExternDecl(p: *Parser, m: Mark) Error!*ast.Stmt {
     const label = try p.expectIdent();
     const h = try p.parseDeclHead();
@@ -1032,12 +1026,11 @@ fn parseDeclHead(p: *Parser) Error!DeclHead {
     return .{ .base = base, .name = d.name, .ty = d.ty, .mark = dm, .storage = storage };
 }
 
-/// Parses an optional `reg [REG]` or `noreg` storage class that, in HolyC,
-/// sits between a declaration's type and the variable name (`I64 reg R15 i,
-/// noreg j;`). The register name (if any) is the physical register the
-/// variable is pinned to; it is distinguished from the variable name by being
-/// followed by another identifier or a `*` (a lone identifier after `reg` is
-/// the variable itself).
+/// Parses an optional `reg [REG]` or `noreg` storage class, which in HolyC sits
+/// between a declaration's type and the variable name (`I64 reg R15 i,
+/// noreg j;`). The register name (if any) is the physical register the variable
+/// is pinned to; it is told from the variable name by being followed by another
+/// identifier or a `*` (a lone identifier after `reg` is the variable itself).
 fn parseStorageSpec(p: *Parser) Error!StorageSpec {
     if (try p.eatKw(.reg)) {
         var name: []const u8 = "";
@@ -1237,10 +1230,9 @@ fn parseParams(p: *Parser) Error!Params {
 }
 
 /// Parses an anonymous `class { … }` / `union { … }` written as a type (e.g.
-/// `class { I64 x; } a, b;`). It synthesizes a uniquely-named ClassDef, hoists
-/// it to the top level, and returns a named type referring to it, so the
-/// anonymous type behaves like an ordinary named aggregate wherever a type may
-/// appear.
+/// `class { I64 x; } a, b;`). Synthesizes a uniquely-named ClassDef, hoists it
+/// to the top level, and returns a named type referring to it, so it behaves
+/// like an ordinary named aggregate wherever a type may appear.
 fn parseAnonAggregate(p: *Parser) Error!ast.Type {
     const m = try p.mark();
     const kw_tok = try p.advance(); // class | union
@@ -1290,9 +1282,9 @@ fn parseClass(p: *Parser, m: Mark, is_public: bool) Error!*ast.Stmt {
 }
 
 /// Whether one or more variable declarators follow a class body
-/// (`class Foo {…} a, b;`), distinguishing them from a following statement: it
-/// accepts `(*)* Ident` followed by `,`, `;`, `=`, or `[`. So
-/// `class P {…} OtherType y;` stays a separate declaration.
+/// (`class Foo {…} a, b;`), as opposed to a following statement: accepts
+/// `(*)* Ident` followed by `,`, `;`, `=`, or `[`. So `class P {…} OtherType y;`
+/// stays a separate declaration.
 fn looksLikeInlineInstance(p: *Parser) Error!bool {
     var i: usize = 0;
     while (true) {
@@ -1372,10 +1364,10 @@ fn parseClassFields(p: *Parser) Error![]const ast.Declarator {
     return fields.toOwnedSlice(p.arena);
 }
 
-/// Parses HolyC member metadata that may follow a class-field declarator: zero
-/// or more `key value` pairs, where key is an identifier (e.g. `format`,
-/// `data`) and value is a string or integer literal. Stops at the `,` or `;`
-/// that ends the declarator.
+/// Parses HolyC member metadata following a class-field declarator: zero or
+/// more `key value` pairs, where key is an identifier (e.g. `format`) and value
+/// is a string or integer literal. Stops at the `,` or `;` that ends the
+/// declarator.
 fn parseFieldMeta(p: *Parser) Error![]const ast.FieldMeta {
     var meta: std.ArrayList(ast.FieldMeta) = .empty;
     while (try p.at(.ident)) {
@@ -1405,9 +1397,8 @@ fn parseExpr(p: *Parser) Error!*ast.Expr {
     return p.newExpr(.{ .comma = try items.toOwnedSlice(p.arena) }, m);
 }
 
-/// Handles the assignment level (right-associative). HolyC has no conditional
-/// (?:) operator; the assignment level sits directly on top of the
-/// binary-operator level.
+/// The assignment level (right-associative). HolyC has no conditional (?:)
+/// operator; assignment sits directly on top of the binary-operator level.
 fn parseAssign(p: *Parser) Error!*ast.Expr {
     const m = try p.mark();
     const lhs = try p.parseBinary(0);

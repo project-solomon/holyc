@@ -1,8 +1,8 @@
 // CTask.HC — the task / exception context, TempleOS's CTask (reachable as
-// Fs): the try/throw/catch machinery and the backends read its
-// fields. Part of the always-resident prelude (see Lib.HC).
-#ifndef __PRELUDE_CTASK_HC
-#define __PRELUDE_CTASK_HC
+// Fs). The try/throw/catch machinery and the backends read its fields. Part
+// of the always-resident core (see core.zig).
+#ifndef __CORE_CTASK_HC
+#define __CORE_CTASK_HC
 
 public class CTask {
   U8  *self;         // self-pointer (the TLS slot stores &CTask)
@@ -11,4 +11,4 @@ public class CTask {
   U8  *exc_top;      // top of this thread's try/catch handler-frame chain
 };
 
-#endif // __PRELUDE_CTASK_HC
+#endif // __CORE_CTASK_HC

@@ -1,13 +1,13 @@
 //! The HolyC lexer: turns source text into a stream of Tokens.
 //!
-//! The lexer walks an in-memory buffer (source files are read whole by the
-//! driver and preprocessor). All syntactically meaningful HolyC characters are
-//! ASCII; non-ASCII bytes may appear only inside string/char literals and
-//! comments, where they pass through untouched.
+//! Walks an in-memory buffer (source files are read whole by the driver and
+//! preprocessor). All meaningful HolyC characters are ASCII; non-ASCII bytes
+//! appear only inside string/char literals and comments, where they pass
+//! through untouched.
 //!
 //! Identifiers are slices into the source buffer; string literals (which need
-//! escape resolution) are allocated from the front-end arena given to `init`.
-//! Errors are reported through the shared diagnostics list with stage `.lex`.
+//! escape resolution) are allocated from the arena given to `init`. Errors go
+//! to the shared diagnostics list with stage `.lex`.
 
 const std = @import("std");
 const source = @import("source.zig");
@@ -23,8 +23,8 @@ pub const Error = diag.Error;
 src: []const u8,
 arena: std.mem.Allocator,
 diags: *diag.Diagnostics,
-/// The file-table id stamped onto this lexer's diagnostics; the preprocessor
-/// sets it for #include frames (the root source is file 0).
+/// File-table id stamped onto this lexer's diagnostics. The preprocessor sets
+/// it for #include frames (root source is file 0).
 file: u32 = 0,
 idx: usize = 0,
 line: u32 = 1,
@@ -34,9 +34,9 @@ pub fn init(arena: std.mem.Allocator, diags: *diag.Diagnostics, src: []const u8)
     return .{ .src = src, .arena = arena, .diags = diags };
 }
 
-/// Produces the next token. Once the input is exhausted this returns an .eof
-/// token and keeps returning it, so calling past the end is safe. On
-/// `error.CompileFailed` the diagnostics list holds the message and position.
+/// Returns the next token. After input is exhausted returns .eof repeatedly,
+/// so calling past the end is safe. On `error.CompileFailed` the diagnostics
+/// list holds the message and position.
 pub fn next(l: *Lexer) Error!Token {
     try l.skipTrivia();
 
@@ -64,7 +64,7 @@ fn peekAt(l: *Lexer, off: usize) ?u8 {
     return null;
 }
 
-/// Consumes one byte, updating position tracking.
+/// Consumes one byte, updating line/col.
 fn bump(l: *Lexer) ?u8 {
     if (l.idx >= l.src.len) return null;
     const b = l.src[l.idx];
@@ -102,7 +102,7 @@ fn skipTrivia(l: *Lexer) Error!void {
             ' ', '\t', '\r', '\n' => _ = l.bump(),
             '/' => switch (l.peekAt(1) orelse 0) {
                 '/' => {
-                    // Line comment: consume to (but not past) end of line.
+                    // Line comment: consume to end of line, not past it.
                     while (l.peek()) |c2| {
                         if (c2 == '\n') break;
                         _ = l.bump();
@@ -147,7 +147,7 @@ fn lexIdent(l: *Lexer, start: usize, p: source.Pos) Token {
 // ---- numbers ----
 
 fn lexNumber(l: *Lexer, start: usize, p: source.Pos) Error!Token {
-    // Radix-prefixed integers: 0x.. (hex). HolyC has no binary (0b) literals.
+    // 0x hex. HolyC has no binary (0b) literals.
     if (l.peek() == '0') {
         switch (l.peekAt(1) orelse 0) {
             'x', 'X' => {
@@ -159,13 +159,13 @@ fn lexNumber(l: *Lexer, start: usize, p: source.Pos) Error!Token {
         }
     }
 
-    // Decimal integer or float. Scan the integer part first.
+    // Decimal integer or float. Integer part first.
     while (isDigit(l.peek() orelse 0)) _ = l.bump();
 
     var is_float = false;
 
-    // Fractional part: a '.' followed by a digit, so `1.foo` and `1..2` are
-    // not mis-lexed as floats.
+    // Fractional part: '.' then a digit, so `1.foo` and `1..2` aren't
+    // mis-lexed as floats.
     if (l.peek() == '.' and isDigit(l.peekAt(1) orelse 0)) {
         is_float = true;
         _ = l.bump(); // .
@@ -195,7 +195,7 @@ fn lexNumber(l: *Lexer, start: usize, p: source.Pos) Error!Token {
         return l.tok(.{ .float = v }, start, p);
     }
     if (text.len > 1 and text[0] == '0') {
-        // A leading `0` on a multi-digit integer means octal, as in C.
+        // Leading `0` on a multi-digit integer means octal, as in C.
         const v = parseIntStr(text, 8) orelse
             return l.fail(p, "invalid octal literal `{s}` (digits must be 0-7)", .{text});
         return l.tok(.{ .int = v }, start, p);
@@ -248,8 +248,8 @@ fn lexString(l: *Lexer, start: usize, p: source.Pos) Error!Token {
 
 // ---- character constants ----
 
-/// Lexes a HolyC character constant, which may hold several characters packed
-/// little-endian into an I64. So 'A' == 0x41 and 'AB' == 0x4241.
+/// Lexes a HolyC character constant, which may pack several chars little-endian
+/// into an I64: 'A' == 0x41, 'AB' == 0x4241.
 fn lexChar(l: *Lexer, start: usize, p: source.Pos) Error!Token {
     _ = l.bump(); // opening '
     var value: i64 = 0;
@@ -287,8 +287,8 @@ fn packChar(l: *Lexer, value: *i64, count: *u32, ch: u21, p: source.Pos) Error!v
     count.* += 1;
 }
 
-/// Consumes one escape sequence body and returns the resulting character. The
-/// backslash has already been eaten.
+/// Consumes one escape sequence body and returns the character. The backslash
+/// is already eaten.
 fn lexEscape(l: *Lexer, p: source.Pos) Error!u21 {
     const c = l.bump() orelse
         return l.fail(p, "unterminated escape sequence", .{});
@@ -321,8 +321,8 @@ fn lexEscape(l: *Lexer, p: source.Pos) Error!u21 {
     };
 }
 
-/// Consumes one UTF-8 encoded character at the cursor and returns it. Assumes
-/// a byte is available; invalid UTF-8 yields the replacement character.
+/// Consumes one UTF-8 character at the cursor and returns it. Assumes a byte is
+/// available; invalid UTF-8 yields the replacement character.
 fn bumpChar(l: *Lexer) u21 {
     const first = l.src[l.idx];
     const len = std.unicode.utf8ByteSequenceLength(first) catch {

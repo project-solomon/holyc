@@ -1,19 +1,18 @@
 //! Computes the in-memory size, alignment, and field offsets of every
 //! class/union, plus the compile-time constant-expression evaluator.
 //!
-//! Layout is a standalone pass: the frontend runs it after sema and folds its
-//! errors into the shared diagnostics; the backends consume its results. The
-//! layout model is natural alignment with padding, matching the x86-64 C ABI:
-//!   - Scalar alignments equal their sizes: I8=1, I16=2, I32=4, and
+//! Standalone pass: the frontend runs it after sema and folds its errors into
+//! the shared diagnostics; the backends consume its results. The model is
+//! natural alignment with padding, matching the x86-64 C ABI:
+//!   - Scalar alignments equal their sizes: I8=1, I16=2, I32=4,
 //!     I64/U64/F64/pointer=8.
-//!   - Each field is placed at the next offset that is a multiple of its
-//!     alignment, inserting padding as needed.
-//!   - A class's alignment is the maximum of its fields' alignments; its size
-//!     is rounded up to that alignment so arrays of it stay aligned.
+//!   - Each field goes at the next offset that is a multiple of its alignment,
+//!     inserting padding as needed.
+//!   - A class's alignment is the max of its fields'; its size is rounded up to
+//!     that alignment so arrays of it stay aligned.
 //!   - A union places every field at offset 0; its size is the largest field,
-//!     rounded up to the maximum alignment.
-//!   - A base class is laid out as a subobject at offset 0, before derived
-//!     fields.
+//!     rounded up to the max alignment.
+//!   - A base class is a subobject at offset 0, before derived fields.
 //!
 //! The whole rule lives in alignOfScalar and roundUp; a packed layout
 //! (alignment 1) would change only those. Constant folding follows Go's int64
@@ -38,8 +37,8 @@ pub const AggLayout = struct {
     size: u64 = 0,
     alignment: u64 = 1,
     is_union: bool = false,
-    /// Fields in offset order, including any inherited from base classes and
-    /// any promoted from anonymous embedded unions/structs.
+    /// Fields in offset order, including those inherited from base classes and
+    /// promoted from anonymous embedded unions/structs.
     fields: []const FieldLayout = &.{},
 
     pub fn field(l: *const AggLayout, name: []const u8) ?*const FieldLayout {
@@ -124,19 +123,19 @@ pub const Layouts = struct {
 
 // ---- the layout pass ----
 
-/// A class definition paired with the position of its definition, for
-/// base-class and cycle errors.
+/// A class definition with its definition position, for base-class and cycle
+/// errors.
 const ClassDefRef = struct {
     def: *const ast.ClassDef,
     pos: source.Pos,
     file: u32,
 };
 
-/// Computes the in-memory layout of every class and union in prog and stores
-/// it on prog.layouts. Layout errors (a cyclic by-value type, a non-constant
-/// or negative field array size) are recorded as .layout diagnostics and
-/// error.CompileFailed is returned; the table is still populated (best-effort
-/// sizes) even then, so callers can keep going.
+/// Computes the in-memory layout of every class and union in prog and stores it
+/// on prog.layouts. Layout errors (a cyclic by-value type, a non-constant or
+/// negative field array size) are recorded as .layout diagnostics and
+/// error.CompileFailed is returned; the table is still populated with
+/// best-effort sizes, so callers can keep going.
 pub fn compute(arena: std.mem.Allocator, diags: *diag.Diagnostics, prog: *ast.Program) diag.Error!void {
     const out = try arena.create(Layouts);
     out.* = .{};
@@ -160,8 +159,8 @@ pub fn compute(arena: std.mem.Allocator, diags: *diag.Diagnostics, prog: *ast.Pr
     if (l.had_error) return error.CompileFailed;
 }
 
-/// The layout pass state. It populates the layout table and reports any
-/// errors through the shared diagnostics.
+/// The layout pass state. Populates the layout table and reports errors through
+/// the shared diagnostics.
 const Layouter = struct {
     arena: std.mem.Allocator,
     diags: *diag.Diagnostics,
@@ -214,8 +213,7 @@ const Layouter = struct {
             if (!def.is_union) field_offset = roundUp(offset, a);
             try fields.append(l.arena, .{ .name = f.name, .ty = f.ty, .offset = field_offset, .size = s });
             // An anonymous embedded union promotes its members into this class
-            // at the union's offset, so obj.member resolves to the correct
-            // slot.
+            // at the union's offset, so obj.member resolves correctly.
             if (ast.isAnonField(f.name)) {
                 switch (f.ty) {
                     .named => |inner| {
@@ -269,8 +267,7 @@ const Layouter = struct {
                 // A sizeof(aggregate) in the dimension (e.g.
                 // U8 buf[sizeof(Other)]) is a compile-time constant, but
                 // folding it needs that aggregate's size, so force each
-                // referenced class first; then fold the dimension against the
-                // layouts so far.
+                // referenced class first, then fold against the layouts so far.
                 var referenced: std.ArrayList([]const u8) = .empty;
                 try collectSizeofAggregates(l.arena, size_expr, &referenced);
                 for (referenced.items) |rn| {
@@ -296,9 +293,8 @@ const Layouter = struct {
 };
 
 /// Collects the base named aggregate of every sizeof(non-scalar) in e, so the
-/// layout pass can force those classes before folding e as an array
-/// dimension. Pointers are skipped (a pointer's size never depends on its
-/// pointee's layout).
+/// layout pass can force those classes before folding e as an array dimension.
+/// Pointers are skipped (a pointer's size never depends on its pointee).
 fn collectSizeofAggregates(arena: std.mem.Allocator, e: *const ast.Expr, out: *std.ArrayList([]const u8)) error{OutOfMemory}!void {
     switch (e.kind) {
         .sizeof => |k| {
@@ -362,7 +358,7 @@ pub fn roundUp(value: u64, alignment: u64) u64 {
 // ---- constant expression evaluation (for field array sizes) ----
 
 /// A constant-folding failure: the message and the position of the
-/// subexpression that could not be folded.
+/// subexpression that couldn't be folded.
 pub const EvalError = struct {
     message: []const u8,
     pos: source.Pos,
@@ -374,10 +370,10 @@ pub const EvalResult = union(enum) {
     err: EvalError,
 };
 
-/// Evaluates a compile-time constant integer expression. It supports
-/// literals; arithmetic, bitwise, comparison, and logical operators; integer
-/// casts; and sizeof of a scalar type. Anything else (a variable, a call,
-/// sizeof of an aggregate) is rejected.
+/// Evaluates a compile-time constant integer expression: literals; arithmetic,
+/// bitwise, comparison, and logical operators; integer casts; and sizeof of a
+/// scalar type. Anything else (a variable, a call, sizeof of an aggregate) is
+/// rejected.
 pub fn constEval(e: *const ast.Expr) EvalResult {
     return constEvalIn(e, null);
 }

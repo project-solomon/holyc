@@ -1,24 +1,50 @@
-// KConfig.HC — compiler-predefined constants. Included first because macros must
-// be in scope before anything is parsed (they are resolved by the preprocessor, so
-// they cannot be supplied any later).
+// KConfig.HC — compiler-predefined constants and the standard target macros.
+// Injected first (see core.zig boot order) because macros must be in scope
+// before anything is parsed: the preprocessor resolves them, so they can't be
+// supplied later.
 //
-// The target macros below are NOT defined here; they are seeded separately by
-// the preprocessor (see targetMacros in hcc/frontend/Preprocessor.zig), keyed
-// off the active target triple. Each expands to 1:
-//   __HCC__                        always defined
-//   __amd64__                      arch is amd64
-//   __arm64__                      arch is arm64
-//   __riscv64__                    arch is riscv64
-//   __ppc64le__                    arch is ppc64le
-//   __s390x__                      arch is s390x
-//   __APPLE__, __MACH__, __unix__  OS is darwin
-//   __linux__, __unix__            OS is linux
-//   _WIN32, _WIN64                 OS is windows
-#ifndef __PRELUDE_KCONFIG_HC
-#define __PRELUDE_KCONFIG_HC
+// The compiler seeds one internal flag per arch/OS from the target triple (see
+// targetMacros in hcc/frontend/Preprocessor.zig): __HCC_ARCH_*__ and
+// __HCC_OS_*__. This file derives the public spellings from them, so `#ifdef
+// __APPLE__` works and an editor can jump to the definition here. __HCC__
+// (always defined) is seeded directly by the compiler.
+#ifndef __CORE_KCONFIG_HC
+#define __CORE_KCONFIG_HC
 
 #define NULL  0
 #define TRUE  1
 #define FALSE 0
 
-#endif // __PRELUDE_KCONFIG_HC
+// Architecture (exactly one is active).
+#ifdef __HCC_ARCH_AMD64__
+#define __amd64__ 1
+#endif
+#ifdef __HCC_ARCH_ARM64__
+#define __arm64__ 1
+#endif
+#ifdef __HCC_ARCH_RISCV64__
+#define __riscv64__ 1
+#endif
+#ifdef __HCC_ARCH_PPC64LE__
+#define __ppc64le__ 1
+#endif
+#ifdef __HCC_ARCH_S390X__
+#define __s390x__ 1
+#endif
+
+// Operating system (exactly one is active).
+#ifdef __HCC_OS_DARWIN__
+#define __APPLE__ 1
+#define __MACH__  1
+#define __unix__  1
+#endif
+#ifdef __HCC_OS_LINUX__
+#define __linux__ 1
+#define __unix__  1
+#endif
+#ifdef __HCC_OS_WINDOWS__
+#define _WIN32 1
+#define _WIN64 1
+#endif
+
+#endif // __CORE_KCONFIG_HC

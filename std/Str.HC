@@ -1,9 +1,9 @@
 // Str.HC — C-string utilities, in pure HolyC.
 //
-// Part of the HolyC standard library: on-disk source shipped with the
-// toolchain and pulled in with `#include <Str.HC>`. Unlike the prelude, none
-// of this is implicit — a program opts in. The bodies are ordinary HolyC, so
-// the LLVM backend inlines and dead-strips them per program.
+// Standard library: on-disk source shipped with the toolchain, pulled in with
+// `#include <Str.HC>`. Unlike the core, none of this is implicit; a program
+// opts in. The bodies are ordinary HolyC, so the LLVM backend inlines and
+// dead-strips them per program.
 #ifndef __STD_STR_HC
 #define __STD_STR_HC
 

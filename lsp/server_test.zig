@@ -278,7 +278,7 @@ test "definition jumps to the declaration; on the declaration it yields null (re
     }
 }
 
-test "definition on a prelude symbol jumps into the extracted core cache" {
+test "definition on a core symbol jumps into the extracted core cache" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -290,7 +290,7 @@ test "definition on a prelude symbol jumps into the extracted core cache" {
     cwd.deleteTree(io, cache_dir) catch {};
     defer cwd.deleteTree(io, cache_dir) catch {};
 
-    // FltToBits (declared in the prelude's StrPrint.HC) starts at column 17 of
+    // FltToBits (declared in the core's StrPrint.HC) starts at column 17 of
     // the body below; the cursor at column 20 sits inside it.
     const bodies = [_][]const u8{
         \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}
@@ -332,6 +332,69 @@ test "definition on a prelude symbol jumps into the extracted core cache" {
     try std.testing.expectEqualStrings("file:///tmp/holyc-lsp-test-core/StrPrint.HC", getStr(loc, "uri"));
     const extracted = try cwd.readFileAlloc(io, cache_dir ++ "/StrPrint.HC", arena, .limited(1 << 20));
     try std.testing.expect(std.mem.indexOf(u8, extracted, "FltToBits") != null);
+}
+
+test "definition on a macro jumps to its #define (in-file and core)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    const cache_dir = "/tmp/holyc-lsp-test-macro";
+    const cwd = std.Io.Dir.cwd();
+    cwd.deleteTree(io, cache_dir) catch {};
+    defer cwd.deleteTree(io, cache_dir) catch {};
+
+    // Line 0: `#define FOO 7` (FOO at cols 8..11)
+    // Line 1: `I64 a = FOO;`  (use of FOO at col 8) -> jumps to line 0
+    // Line 2: `I64 b = TRUE;` (use of TRUE at col 8) -> jumps into KConfig.HC
+    const bodies = [_][]const u8{
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}
+        ,
+        \\{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///t.HC","languageId":"holyc","version":1,"text":"#define FOO 7\nI64 a = FOO;\nI64 b = TRUE;"}}}
+        ,
+        \\{"jsonrpc":"2.0","id":2,"method":"textDocument/definition","params":{"textDocument":{"uri":"file:///t.HC"},"position":{"line":1,"character":9}}}
+        ,
+        \\{"jsonrpc":"2.0","id":3,"method":"textDocument/definition","params":{"textDocument":{"uri":"file:///t.HC"},"position":{"line":2,"character":9}}}
+        ,
+        \\{"jsonrpc":"2.0","id":9,"method":"shutdown"}
+        ,
+        \\{"jsonrpc":"2.0","method":"exit"}
+        ,
+    };
+
+    var input: std.Io.Writer.Allocating = .init(gpa);
+    defer input.deinit();
+    for (bodies) |b| try framing.writeFrame(&input.writer, b);
+    var in_r = std.Io.Reader.fixed(input.written());
+    var out_w: std.Io.Writer.Allocating = .init(gpa);
+    defer out_w.deinit();
+
+    var server = Server.init(gpa, io, &in_r, &out_w.writer);
+    server.core_cache_dir = try gpa.dupe(u8, cache_dir);
+    defer server.deinit();
+    try std.testing.expectEqual(0, try server.run());
+
+    var msgs: std.ArrayList(std.json.Value) = .empty;
+    var out_r = std.Io.Reader.fixed(out_w.written());
+    while (true) {
+        const body = framing.readFrame(&out_r, arena) catch |e| switch (e) {
+            error.EndOfStream => break,
+            else => return e,
+        };
+        try msgs.append(arena, try std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{}));
+    }
+
+    // FOO resolves to its own #define on line 0.
+    const foo = get(byId(msgs.items, 2), "result");
+    try std.testing.expectEqualStrings("file:///t.HC", getStr(foo, "uri"));
+    try std.testing.expectEqual(0, getInt(get(get(foo, "range"), "start"), "line"));
+    try std.testing.expectEqual(8, getInt(get(get(foo, "range"), "start"), "character"));
+
+    // TRUE resolves into the extracted core (KConfig.HC).
+    const t = get(byId(msgs.items, 3), "result");
+    try std.testing.expectEqualStrings("file:///tmp/holyc-lsp-test-macro/KConfig.HC", getStr(t, "uri"));
 }
 
 test "malformed JSON body gets a ParseError response and the loop survives" {

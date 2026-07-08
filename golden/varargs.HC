@@ -1,6 +1,6 @@
 // Variadic functions. Inside a function declared with `...`, the implicit `argc` is
 // the number of variadic arguments and `argv` is an I64* to them (argv[i] is the i-th
-// vararg) — the same convention the prelude's Print uses. Works with and without a
+// vararg) — the same convention the core's Print uses. Works with and without a
 // leading named parameter.
 
 I64 Total(...)
