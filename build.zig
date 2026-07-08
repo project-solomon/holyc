@@ -43,8 +43,16 @@ pub fn build(b: *std.Build) void {
     // running it simply requires the LLVM install named by -Dllvm-prefix.
     const llvm_lib_dir = b.pathJoin(&.{ llvm_prefix, "lib" });
     llvm_mod.addLibraryPath(.{ .cwd_relative = llvm_lib_dir });
-    llvm_mod.addRPath(.{ .cwd_relative = llvm_lib_dir });
-    llvm_mod.linkSystemLibrary("LLVM", .{});
+    if (target.result.os.tag == .windows) {
+        // MinGW ships the shared libLLVM as the import library libLLVM.dll.a,
+        // which linkSystemLibrary's name search (LLVM.dll / LLVM.lib / libLLVM.a)
+        // does not match; link it by path. Windows has no rpath, so the libLLVM
+        // DLL must be on PATH (or beside the exe) at run time.
+        llvm_mod.addObjectFile(.{ .cwd_relative = b.pathJoin(&.{ llvm_lib_dir, "libLLVM.dll.a" }) });
+    } else {
+        llvm_mod.addRPath(.{ .cwd_relative = llvm_lib_dir });
+        llvm_mod.linkSystemLibrary("LLVM", .{});
+    }
     llvm_mod.link_libc = true;
 
     const exe = b.addExecutable(.{
