@@ -1,14 +1,11 @@
 name: release
 
 # Manually triggered. Enter the version (e.g. 0.2.0); the release is tagged
-# v<version>. Builds hcc + holyc-lsp for Linux (amd64/arm64), macOS (arm64 and
-# Intel), and Windows (amd64), packages them as the assets install.sh/install.ps1
-# expect, and publishes a GitHub release at the current commit.
+# v<version>. Builds hcc + holyc-lsp for Linux (amd64/arm64) and macOS (arm64 and
+# Intel), packages them as the assets install.sh expects, and publishes a GitHub
+# release at the current commit.
 #
-# Windows note: hcc links libLLVM dynamically, and the official LLVM Windows
-# installer ships no libLLVM. We use MSYS2's mingw libLLVM instead, build the
-# `x86_64-windows-gnu` target, and bundle libLLVM.dll + its mingw runtime deps
-# into the asset (install.ps1 installs them beside hcc.exe).
+# No Windows build yet: hcc's dynamic libLLVM link on Windows is unresolved.
 on:
   workflow_dispatch:
     inputs:
@@ -35,21 +32,8 @@ jobs:
           - { runner: ubuntu-24.04-arm, os: linux,   arch: arm64, osfrag: linux }
           - { runner: macos-14,         os: darwin,  arch: arm64, osfrag: apple-darwin }
           - { runner: macos-13,         os: darwin,  arch: amd64, osfrag: apple-darwin }
-          - { runner: windows-latest,   os: windows, arch: amd64, osfrag: windows }
     steps:
       - uses: actions/checkout@v4
-
-      # Windows libLLVM comes from MSYS2's mingw toolchain (the only readily
-      # available shared libLLVM for Windows). The build targets windows-gnu to
-      # match it.
-      - name: Set up MSYS2 + mingw libLLVM (Windows)
-        if: matrix.os == 'windows'
-        uses: msys2/setup-msys2@v2
-        id: msys2
-        with:
-          msystem: MINGW64
-          update: true
-          install: mingw-w64-x86_64-llvm
 
       - name: Set up Zig
         uses: mlugg/setup-zig@v2
@@ -75,21 +59,13 @@ jobs:
 
       # Only the shipped artifacts (hcc + holyc-lsp + std); the e2e/bench
       # harnesses are not part of a release.
-      - name: Build (Linux/macOS)
-        if: matrix.os != 'windows'
+      - name: Build
         run: zig build hcc lsp -Doptimize=ReleaseSafe -Dllvm-prefix="$LLVM_PREFIX"
-
-      - name: Build (Windows)
-        if: matrix.os == 'windows'
-        run: |
-          $prefix = "${{ steps.msys2.outputs.msys2-location }}\mingw64"
-          zig build hcc lsp -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseSafe "-Dllvm-prefix=$prefix"
 
       # Asset layout install.sh expects:
       #   hcc-<tag>-<arch>-<osfrag>.tar.gz        → hcc binary + the std/ tree
       #   holyc-lsp-<tag>-<arch>-<osfrag>.tar.gz  → holyc-lsp binary
-      - name: Package (Linux/macOS)
-        if: matrix.os != 'windows'
+      - name: Package
         run: |
           V="${{ inputs.version }}"; V="${V#v}"; TAG="v$V"
           A="${{ matrix.arch }}-${{ matrix.osfrag }}"
@@ -99,25 +75,6 @@ jobs:
           rm -rf stage && mkdir stage
           cp zig-out/bin/holyc-lsp stage/
           tar -czf "dist/holyc-lsp-$TAG-$A.tar.gz" -C stage holyc-lsp
-
-      # The Windows hcc.exe carries libLLVM.dll + its mingw runtime deps (found
-      # via ldd) at the archive root; install.ps1 installs them beside hcc.exe.
-      - name: Package (Windows)
-        if: matrix.os == 'windows'
-        shell: msys2 {0}
-        run: |
-          V="${{ inputs.version }}"; V="${V#v}"; TAG="v$V"
-          A="amd64-windows"
-          mkdir -p dist stage
-          cp zig-out/bin/hcc.exe stage/
-          cp -r zig-out/std stage/std
-          ldd zig-out/bin/hcc.exe | awk '/\/mingw64\// {print $3}' | sort -u | while read -r dll; do
-            cp -n "$dll" stage/ 2>/dev/null || true
-          done
-          tar -czf "dist/hcc-$TAG-$A.tar.gz" -C stage .
-          rm -rf stage && mkdir stage
-          cp zig-out/bin/holyc-lsp.exe stage/
-          tar -czf "dist/holyc-lsp-$TAG-$A.tar.gz" -C stage holyc-lsp.exe
 
       - uses: actions/upload-artifact@v4
         with:

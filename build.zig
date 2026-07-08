@@ -44,11 +44,13 @@ pub fn build(b: *std.Build) void {
     const llvm_lib_dir = b.pathJoin(&.{ llvm_prefix, "lib" });
     llvm_mod.addLibraryPath(.{ .cwd_relative = llvm_lib_dir });
     if (target.result.os.tag == .windows) {
-        // MinGW ships the shared libLLVM as the import library libLLVM.dll.a,
-        // which linkSystemLibrary's name search (LLVM.dll / LLVM.lib / libLLVM.a)
-        // does not match; link it by path. Windows has no rpath, so the libLLVM
-        // DLL must be on PATH (or beside the exe) at run time.
-        llvm_mod.addObjectFile(.{ .cwd_relative = b.pathJoin(&.{ llvm_lib_dir, "libLLVM.dll.a" }) });
+        // Windows LLVM packagings name the import library differently (MinGW:
+        // libLLVM.dll.a or libLLVM-C.dll.a; MSVC: LLVM-C.lib), and none match
+        // linkSystemLibrary's name search. Find whichever exists and link it by
+        // path. Windows has no rpath, so the libLLVM DLL must be on PATH (or
+        // beside the exe) at run time.
+        const import_lib = findWindowsLlvmLib(b, llvm_lib_dir);
+        llvm_mod.addObjectFile(.{ .cwd_relative = b.pathJoin(&.{ llvm_lib_dir, import_lib }) });
     } else {
         llvm_mod.addRPath(.{ .cwd_relative = llvm_lib_dir });
         llvm_mod.linkSystemLibrary("LLVM", .{});
@@ -152,4 +154,37 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_frontend_tests.step);
     test_step.dependOn(&run_llvm_tests.step);
     test_step.dependOn(&run_lsp_tests.step);
+}
+
+/// Picks the LLVM import library to link on Windows by scanning lib_dir, since
+/// its name varies by packaging. Prefers a dynamic import lib (`.dll.a`) — hcc
+/// links libLLVM dynamically — and the whole-library over the C-API-only one,
+/// falling back to an MSVC `.lib`. Fails with a listing when none is found, so
+/// the build log names what is actually present.
+fn findWindowsLlvmLib(b: *std.Build, lib_dir: []const u8) []const u8 {
+    const io = b.graph.io;
+    var dir = std.Io.Dir.openDirAbsolute(io, lib_dir, .{ .iterate = true }) catch |e|
+        std.debug.panic("cannot open LLVM lib dir {s}: {s}", .{ lib_dir, @errorName(e) });
+    defer dir.close(io);
+
+    var best: ?[]const u8 = null;
+    var best_rank: u8 = 0;
+    var present: std.ArrayList(u8) = .empty; // LLVM files seen, for the error
+    var it = dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (entry.kind != .file) continue;
+        if (std.mem.indexOf(u8, entry.name, "LLVM") == null) continue;
+        present.append(b.allocator, ' ') catch {};
+        present.appendSlice(b.allocator, entry.name) catch {};
+        const rank: u8 =
+            if (std.mem.eql(u8, entry.name, "libLLVM.dll.a")) 5 else if (std.mem.eql(u8, entry.name, "libLLVM-C.dll.a")) 4 else if (std.mem.endsWith(u8, entry.name, ".dll.a")) 3 else if (std.mem.eql(u8, entry.name, "LLVM-C.lib")) 2 else if (std.mem.eql(u8, entry.name, "LLVM.lib")) 1 else 0;
+        if (rank > best_rank) {
+            best_rank = rank;
+            best = b.allocator.dupe(u8, entry.name) catch @panic("OOM");
+        }
+    }
+    return best orelse std.debug.panic(
+        "no LLVM import library found in {s}. LLVM files present:{s}",
+        .{ lib_dir, present.items },
+    );
 }
